@@ -72,6 +72,21 @@ more real than a laptop demo:
 - **CORS is entirely unset** — whatever each backend does on its own,
   unreviewed.
 
+## Performance
+
+- **Consider rewriting `scoring-service` in Go.** It's on the hot path —
+  every single request through Envoy blocks on an HTTP round-trip to it
+  (`ext_authz`, `EXT_AUTHZ_TIMEOUT_MS` fails closed) — and it's currently
+  Python/FastAPI. `coraza-service` and `envoy-control-plane` are already Go;
+  moving `scoring-service` there too would cut per-request latency
+  (no interpreter overhead, no GIL contention across concurrent requests)
+  and would open the door to replacing ext_authz's HTTP mode with its gRPC
+  mode for a faster, more efficient check protocol than JSON-over-HTTP.
+  The real cost is rewriting `scoring.py`'s signal-combination logic and
+  the CrowdSec/Coraza HTTP clients in Go — not huge, but not nothing.
+  Worth doing if per-request latency ever actually matters here; today's
+  `EXT_AUTHZ_TIMEOUT_MS=200` has never been the bottleneck in testing.
+
 ## Known limitations / not fully verified
 
 - **HTTP/3 (QUIC)** is wired up (UDP listener bound, `alt-svc` advertised,

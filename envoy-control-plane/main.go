@@ -397,10 +397,17 @@ const (
 
 func buildHTTPConnectionManager(routeConfigName string) *hcmv3.HttpConnectionManager {
 	return &hcmv3.HttpConnectionManager{
-		StatPrefix:        "ingress_http",
-		UseRemoteAddress:  wrapperspb.Bool(true),
-		LocalReplyConfig:  buildLocalReplyConfig(),
-		StreamIdleTimeout: durationpb.New(streamIdleTimeout),
+		StatPrefix:       "ingress_http",
+		UseRemoteAddress: wrapperspb.Bool(true),
+		LocalReplyConfig: buildLocalReplyConfig(),
+		// PASS_THROUGH (not the OVERWRITE default): OVERWRITE means Envoy
+		// always injects "server: envoy" itself — no version number, but it
+		// still names the proxy technology. PASS_THROUGH means Envoy doesn't
+		// inject anything of its own, which lets the RouteConfiguration's
+		// ResponseHeadersToRemove (see buildRouteConfig) actually strip
+		// whatever the upstream sent instead of it coming back right after.
+		ServerHeaderTransformation: hcmv3.HttpConnectionManager_PASS_THROUGH,
+		StreamIdleTimeout:          durationpb.New(streamIdleTimeout),
 		AccessLog: []*accesslogv3.AccessLog{
 			{
 				Name: "envoy.access_loggers.stdout",
@@ -682,7 +689,12 @@ func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.Hea
 			}},
 		}},
 	})
-	return &routev3.RouteConfiguration{Name: name, VirtualHosts: vhosts, ResponseHeadersToAdd: responseHeaders}
+	return &routev3.RouteConfiguration{
+		Name:                    name,
+		VirtualHosts:            vhosts,
+		ResponseHeadersToAdd:    responseHeaders,
+		ResponseHeadersToRemove: []string{"server"}, // strip whatever the upstream sent (nginx, Express...) — see ServerHeaderTransformation above for why this actually sticks
+	}
 }
 
 type generator struct {
