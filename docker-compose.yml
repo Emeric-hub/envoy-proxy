@@ -51,6 +51,13 @@ services:
     image: nginx:alpine
     volumes:
       - ./envoy/default-site:/usr/share/nginx/html:ro
+      # server_tokens off (hides nginx's version, in headers AND its own
+      # default error pages) + routes any unmatched path to the same
+      # branded page instead of nginx's raw 404 — see the file's own
+      # comment for why local_reply_config on Envoy's side can't fix this:
+      # it only rewrites Envoy-generated denials, not genuine upstream
+      # responses like a plain 404 for a missing path.
+      - ./envoy/default-site/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     expose:
       - "80"
 
