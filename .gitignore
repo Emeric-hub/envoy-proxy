@@ -1,0 +1,24 @@
+# Real local config — copy .env.example to .env and customize (init.sh does
+# this for you, including randomizing the CrowdSec bouncer key).
+.env
+
+# CRS is fetched at container startup (coraza-service/crs_fetch.go), not
+# vendored — everything in here is regenerated on first run.
+coraza-service/crs/*
+!coraza-service/crs/.gitkeep
+
+# Self-signed cert/key pairs (generate-cert.sh / init.sh) — regenerable,
+# and private keys don't belong in git regardless.
+envoy/ssl/*.crt
+envoy/ssl/*.key
+!envoy/ssl/.gitkeep
+
+# Runtime log CrowdSec tails — the file must exist (see docker-compose.yml's
+# comment on the crowdsec service) but its content is transient.
+crowdsec/feed/access.log
+
+# Generated test/audit output.
+loadtest/results/*
+!loadtest/results/.gitkeep
+ssl-audit/reports/*
+!ssl-audit/reports/.gitkeep

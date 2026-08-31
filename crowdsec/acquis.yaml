@@ -1,0 +1,4 @@
+filenames:
+  - /var/log/crowdsec-feed/access.log
+labels:
+  type: nginx

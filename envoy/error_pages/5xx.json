@@ -1,0 +1,5 @@
+{
+  "error": "server_error",
+  "status": 503,
+  "message": "The upstream service is unavailable or returned an error."
+}

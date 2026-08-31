@@ -1,0 +1,5 @@
+{
+  "error": "forbidden",
+  "status": 403,
+  "message": "This request was flagged as high-risk and blocked before reaching the application."
+}

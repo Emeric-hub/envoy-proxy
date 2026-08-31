@@ -1,0 +1,5 @@
+id,domain,target,port,ssl,cert_check,scoring
+1,shop.example.com,backend,8443,false,false,true
+2,api.example.com,backend,8443,false,false,true
+3,admin.example.com,backend,8443,false,false,true
+4,secure.example.com,backend,8443,true,false,true

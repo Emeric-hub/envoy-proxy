@@ -1,0 +1,194 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.39.1}
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./envoy/error_pages:/etc/envoy/error_pages:ro
+      # No ssl/ mount here: envoy-control-plane reads and embeds cert/key
+      # bytes directly into the Listener config it pushes (DataSource_InlineBytes,
+      # not a filename reference) — Envoy itself never touches the cert files
+      # on disk, so it doesn't need this mount.
+    ports:
+      - "${ENVOY_HTTP_PORT:-10000}:${ENVOY_HTTP_PORT:-10000}"
+      - "${ENVOY_HTTPS_PORT:-10443}:${ENVOY_HTTPS_PORT:-10443}"
+      # Same port number as above, UDP: HTTP/3 (QUIC) shares the port with
+      # the TCP HTTPS listener — see envoy-control-plane's alt-svc header.
+      - "${ENVOY_HTTPS_PORT:-10443}:${ENVOY_HTTPS_PORT:-10443}/udp"
+      # Admin API (9901) is intentionally NOT published — envoy.yaml binds it
+      # to 127.0.0.1 inside the container (no auth on that API), so reach it
+      # with `docker compose exec envoy` rather than opening it to the host.
+    depends_on:
+      - envoy-control-plane
+      - scoring-service
+      - backend
+      - default-site
+
+  envoy-control-plane:
+    build: ./envoy-control-plane
+    environment:
+      - ENVOY_HTTP_PORT=${ENVOY_HTTP_PORT:-10000}
+      - ENVOY_HTTPS_PORT=${ENVOY_HTTPS_PORT:-10443}
+      - ROUTES_CSV=/etc/envoy-cp/routes/routes.csv
+      - SSL_DIR=/etc/envoy-cp/ssl
+      - EXT_AUTHZ_MAX_BODY_BYTES=${EXT_AUTHZ_MAX_BODY_BYTES:-8192}
+      - EXT_AUTHZ_TIMEOUT_MS=${EXT_AUTHZ_TIMEOUT_MS:-200}
+      - UPSTREAM_CONNECT_TIMEOUT_MS=${UPSTREAM_CONNECT_TIMEOUT_MS:-1000}
+      - REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-15}
+      - STREAM_IDLE_TIMEOUT_S=${STREAM_IDLE_TIMEOUT_S:-300}
+    volumes:
+      # Directory mounts, not single-file mounts: a single-file bind mount is
+      # bound to that file's inode, and an edit that replaces the file (write
+      # to a temp file + rename over the original — common for editors and
+      # some file-write tools) leaves the mount pointing at nothing. A
+      # directory mount reflects live host directory contents instead.
+      - ./envoy-control-plane/routes:/etc/envoy-cp/routes:ro
+      - ./${SSL_DIR:-envoy/ssl}:/etc/envoy-cp/ssl:ro
+    expose:
+      - "18000"
+      - "18001"
+
+  default-site:
+    image: nginx:alpine
+    volumes:
+      - ./envoy/default-site:/usr/share/nginx/html:ro
+    expose:
+      - "80"
+
+  scoring-service:
+    build: ./scoring-service
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CORAZA_URL=http://coraza-service:8003/check
+      - RISK_THRESHOLD=${RISK_THRESHOLD:-0.8}
+      - AUDIT_MODE=${AUDIT_MODE:-false}
+      - ENABLE_CORAZA=${ENABLE_CORAZA:-true}
+      - ENABLE_HEURISTIC=${ENABLE_HEURISTIC:-true}
+      - ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-true}
+      - CROWDSEC_URL=http://crowdsec:8080
+      - CROWDSEC_API_KEY=${CROWDSEC_BOUNCER_KEY:-devbouncerkeychangeme}
+      - CROWDSEC_POLL_INTERVAL=${CROWDSEC_POLL_INTERVAL:-10}
+    volumes:
+      - ./crowdsec/feed:/var/log/crowdsec-feed
+    expose:
+      - "8001"
+    depends_on:
+      redis:
+        condition: service_started
+      # required: false — coraza-service/crowdsec are profile-gated (see
+      # COMPOSE_PROFILES in .env) and may not be running at all. scoring.py
+      # already handles either one being unreachable the same way it handles
+      # ENABLE_CORAZA/ENABLE_CROWDSEC=false: skip that signal, fall back to
+      # the rest. Without required:false, compose refuses to start this
+      # service at all when a profile is disabled.
+      coraza-service:
+        condition: service_started
+        required: false
+      crowdsec:
+        condition: service_started
+        required: false
+
+  coraza-service:
+    profiles: ["coraza"]
+    build: ./coraza-service
+    environment:
+      - CRS_VERSION=${CRS_VERSION:-4.29.0}
+      - CRS_PARANOIA_LEVEL=${CRS_PARANOIA_LEVEL:-1}
+    volumes:
+      # Read-write: coraza-service fetches CRS into this directory itself on
+      # startup (see crs_fetch.go) if it's missing or a different version
+      # than CRS_VERSION — no more manual fetch-crs.sh step.
+      - ./coraza-service/crs:/etc/coraza
+      # Separate from crs/ on purpose — that dir gets wiped and refetched on
+      # every version change, this one persists. Edits here hot-reload, no
+      # restart needed.
+      - ./coraza-service/crs-exclusions:/etc/coraza-exclusions:ro
+    expose:
+      - "8003"
+
+  crowdsec:
+    profiles: ["crowdsec"]
+    image: crowdsecurity/crowdsec:latest
+    environment:
+      - COLLECTIONS=crowdsecurity/nginx
+      # Local-only by design for this demo: no phoning home to CrowdSec's
+      # cloud / community blocklist unless you opt in.
+      - DISABLE_ONLINE_API=true
+      - BOUNCER_KEY_scoring=${CROWDSEC_BOUNCER_KEY:-devbouncerkeychangeme}
+    volumes:
+      # A bind mount to a pre-existing host file (see crowdsec/feed/access.log),
+      # not a named volume: CrowdSec's file datasource only globs for matches
+      # once at startup and never retries, so the file must already exist
+      # before the container starts — a named volume would still be empty at
+      # that point if scoring-service hadn't written to it yet.
+      - ./crowdsec/feed:/var/log/crowdsec-feed:ro
+      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro
+      - crowdsec-data:/var/lib/crowdsec/data
+    expose:
+      - "8080"
+
+  backend:
+    image: mendhak/http-https-echo:31
+    expose:
+      - "8080"
+      - "8443"
+    environment:
+      - HTTP_PORT=8080
+      # routes.csv-driven targets are always connected to over HTTPS (that's
+      # what makes each row's cert_check flag meaningful) — this image
+      # generates its own self-signed cert automatically for this port.
+      - HTTPS_PORT=8443
+
+  redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+
+  dashboard:
+    build: ./dashboard
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      # Same source (.env) as scoring-service — shown as a read-only banner,
+      # never changes scoring-service's actual behavior from here.
+      - RISK_THRESHOLD=${RISK_THRESHOLD:-0.8}
+      - AUDIT_MODE=${AUDIT_MODE:-false}
+      - ENABLE_CORAZA=${ENABLE_CORAZA:-true}
+      - ENABLE_HEURISTIC=${ENABLE_HEURISTIC:-true}
+      - ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-true}
+      # App-level allowlist (belt-and-suspenders on top of DASHBOARD_BIND_ADDR
+      # below) — matters once that bind is opened beyond loopback.
+      - DASHBOARD_BIND_ADDR=${DASHBOARD_BIND_ADDR:-127.0.0.1}
+      - DASHBOARD_ALLOWED_IPS=${DASHBOARD_ALLOWED_IPS:-}
+      - CONTROL_PLANE_URL=http://envoy-control-plane:18001
+    volumes:
+      # Directory mount, not individual files: coraza-service now fetches CRS
+      # on its own first startup, so VERSION/FETCHED_AT may not exist yet on
+      # a fresh checkout — a file-level bind mount would fail or (worse)
+      # Docker would silently create an empty directory in their place. A
+      # directory mount tolerates missing files fine (read code already
+      # handles that gracefully).
+      - ./coraza-service/crs:/crs:ro
+    ports:
+      # Bound to 127.0.0.1 by default — the dashboard has no auth of its own,
+      # so it shouldn't be reachable off-host unless explicitly opened via
+      # DASHBOARD_BIND_ADDR=0.0.0.0 (then use DASHBOARD_ALLOWED_IPS too).
+      - "${DASHBOARD_BIND_ADDR:-127.0.0.1}:${DASHBOARD_PORT:-8002}:8002"
+    depends_on:
+      - redis
+
+  # On-demand only — never starts with `docker compose up`.
+  # Run: docker compose run --rm loadtest
+  loadtest:
+    image: grafana/k6:latest
+    profiles: ["tools"]
+    volumes:
+      - ./loadtest:/scripts:ro
+      - ./loadtest/results:/results
+      - ./coraza-service/crs:/crs:ro
+    environment:
+      - BASE_URL=http://envoy:${ENVOY_HTTP_PORT:-10000}
+    entrypoint: ["k6", "run", "/scripts/smoke.js"]
+    depends_on:
+      - envoy
+
+volumes:
+  crowdsec-data:

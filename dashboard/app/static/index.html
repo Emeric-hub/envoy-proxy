@@ -1,0 +1,582 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Risk classification — live</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 1.5rem; }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 1rem; }
+  .stats { display: flex; gap: 1rem; margin-bottom: 1rem; }
+  .stat { background: #1a1d24; border-radius: 8px; padding: 0.75rem 1.25rem; min-width: 100px; }
+  .stat .value { font-size: 1.6rem; font-weight: 700; }
+  .stat .label { font-size: 0.75rem; color: #9aa0aa; text-transform: uppercase; }
+  .allow { color: #4ade80; }
+  .deny { color: #f87171; }
+
+  .filters { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+  .filters input, .filters select {
+    background: #1a1d24; border: 1px solid #2a2f3a; color: #e6e6e6;
+    border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.85rem;
+  }
+  .filters button {
+    background: #262a33; border: 1px solid #2a2f3a; color: #e6e6e6;
+    border-radius: 6px; padding: 0.4rem 0.8rem; font-size: 0.85rem; cursor: pointer;
+  }
+  .filters button:hover { background: #2f3440; }
+  .filters .count { font-size: 0.8rem; color: #9aa0aa; margin-left: auto; }
+
+  .charts { display: flex; flex-direction: column; gap: 1rem; margin-bottom: 1rem; }
+  .charts-row { display: flex; gap: 1rem; }
+  .chart-col { display: flex; flex-direction: column; gap: 1rem; flex: 1; min-width: 260px; }
+  .chart-box { background: #1a1d24; border-radius: 8px; padding: 1rem; height: 240px; position: relative; }
+  .donut-box { background: #1a1d24; border-radius: 8px; padding: 1rem; height: 220px; cursor: pointer; position: relative; }
+  .donut-box .hint { font-size: 0.7rem; color: #6b7280; text-align: center; margin-top: -0.25rem; }
+  .topology-box { cursor: default; display: flex; flex-direction: column; }
+  .topology-box svg { flex: 1; min-height: 0; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #262a33; }
+  th { color: #9aa0aa; font-weight: 500; }
+  tr.deny td.decision { color: #f87171; }
+  tr.allow td.decision { color: #4ade80; }
+  td.ip { font-family: ui-monospace, monospace; }
+  td.reason { min-width: 260px; max-width: 360px; }
+  td.reason .score-line { color: #60a5fa; font-weight: 600; margin-bottom: 0.15rem; }
+  td.reason .reason-line { white-space: normal; }
+  td.reason .source-heuristic { color: #9aa0aa; }
+  td.reason .source-crs { color: #fb923c; }
+  td.reason .source-crowdsec { color: #a78bfa; }
+  td.reason .no-signals { color: #4ade80; }
+  #status { font-size: 0.75rem; color: #9aa0aa; }
+
+  .config-bar { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .pill { background: #1a1d24; border: 1px solid #2a2f3a; border-radius: 999px; padding: 0.25rem 0.75rem; font-size: 0.75rem; color: #9aa0aa; }
+  .pill .on { color: #4ade80; font-weight: 600; }
+  .pill .off { color: #f87171; font-weight: 600; }
+  .live-dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%; margin-left: 0.35rem; vertical-align: middle; }
+  .live-dot.ok { background: #4ade80; box-shadow: 0 0 4px #4ade80; }
+  .live-dot.down { background: #f87171; box-shadow: 0 0 4px #f87171; }
+  .live-dot.unknown { background: #4b5563; }
+  .audit-tag { color: #facc15; font-weight: 400; font-size: 0.75em; }
+</style>
+<!--ACTIVE_CONFIG-->
+</head>
+<body>
+  <h1>Risk classification — live <span id="status">connecting…</span></h1>
+
+  <div class="config-bar" id="config-bar"></div>
+
+  <div class="stats">
+    <div class="stat"><div class="value" id="stat-total">0</div><div class="label">Total</div></div>
+    <div class="stat"><div class="value allow" id="stat-allow">0</div><div class="label">Allowed</div></div>
+    <div class="stat"><div class="value deny" id="stat-deny">0</div><div class="label">Denied</div></div>
+    <div class="stat"><div class="value" id="stat-rate">0%</div><div class="label">Block rate</div></div>
+    <div class="stat"><div class="value" id="stat-avg-duration">0ms</div><div class="label">Avg duration</div></div>
+    <div class="stat"><div class="value" id="stat-p95-duration">0ms</div><div class="label">P95 duration</div></div>
+  </div>
+
+  <div class="charts">
+    <div class="charts-row">
+      <div class="chart-col">
+        <div class="donut-box"><canvas id="donut-ip"></canvas><div class="hint">click a slice to filter</div></div>
+        <div class="chart-box"><canvas id="chart-blocked-per-ip"></canvas></div>
+      </div>
+      <div class="chart-col">
+        <div class="donut-box"><canvas id="donut-domain"></canvas><div class="hint">click a slice to filter</div></div>
+        <div class="chart-box"><canvas id="chart-blocked-per-domain"></canvas></div>
+      </div>
+      <div class="chart-col">
+        <div class="chart-box"><canvas id="chart-requests-per-backend"></canvas></div>
+        <div class="donut-box topology-box">
+          <div class="hint" style="margin-top:0;">front domain → backend target</div>
+          <svg id="topology-svg" width="100%" height="100%" preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="hint" id="topology-empty" style="display:none;">no routes configured</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="filters">
+    <input id="filter-ip" type="text" placeholder="Filter by IP…">
+    <input id="filter-path" type="text" placeholder="Filter by path…">
+    <input id="filter-domain" type="text" placeholder="Filter by domain…">
+    <select id="filter-decision">
+      <option value="all">All decisions</option>
+      <option value="allow">Allowed only</option>
+      <option value="deny">Denied only</option>
+    </select>
+    <button id="filter-clear">Clear</button>
+    <span class="count" id="filter-count"></span>
+  </div>
+
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr><th>Time</th><th>Source IP</th><th>Domain</th><th>Method</th><th>Path</th><th>User-Agent</th><th>HTTP Status</th><th>Duration</th><th>Target</th><th>Decision</th><th>Reason</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  </div>
+
+<script>
+const MAX_BUFFER = 500;
+const MAX_ROWS = 50;
+const DONUT_COLORS = ['#60a5fa', '#4ade80', '#f87171', '#facc15', '#a78bfa', '#fb923c', '#22d3ee', '#9aa0aa'];
+
+let events = []; // chronological, oldest first
+
+const filters = { ip: '', path: '', domain: '', decision: 'all' };
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  // innerHTML escapes & < > but not quotes, which matters since this also
+  // feeds a title="..." attribute value.
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function classifyReason(text) {
+  if (text.startsWith('CRS ')) return 'source-crs';
+  if (text.startsWith('CrowdSec ')) return 'source-crowdsec';
+  return 'source-heuristic';
+}
+
+// Composite-score breakdown + one colored line per reason, split by tool —
+// this can't be a native title="" tooltip since those render plain text only
+// and can't carry per-line color, so it's built as real cell content instead.
+function buildReasonCell(ev) {
+  const cfg = window.__ACTIVE_CONFIG__ || {};
+  const signals = ev.signals || {};
+  const parts = [];
+  if (cfg.enable_heuristic) parts.push(`heuristic ${(signals.heuristic ?? 0).toFixed(2)}`);
+  if (cfg.enable_coraza) parts.push(`CRS ${(signals.coraza ?? 0).toFixed(2)}`);
+  if (cfg.enable_crowdsec) parts.push(`crowdsec ${(signals.crowdsec ?? 0).toFixed(2)}`);
+  const scoreLine = `score ${ev.score.toFixed(2)}` + (parts.length ? ` = max(${parts.join(', ')})` : '');
+
+  const reasons = ev.reasons || [];
+  const reasonLines = reasons.length
+    ? reasons.map(r => `<div class="reason-line ${classifyReason(r)}">${escapeHtml(r)}</div>`).join('')
+    : '<div class="reason-line no-signals">no risk signals</div>';
+
+  return `<div class="score-line">${escapeHtml(scoreLine)}</div>${reasonLines}`;
+}
+
+function matchesFilter(ev) {
+  if (filters.ip && !ev.ip.toLowerCase().includes(filters.ip)) return false;
+  if (filters.path && !ev.path.toLowerCase().includes(filters.path)) return false;
+  if (filters.domain && !ev.domain.toLowerCase().includes(filters.domain)) return false;
+  if (filters.decision !== 'all' && ev.decision !== filters.decision) return false;
+  return true;
+}
+
+function setFilterInput(key, value) {
+  filters[key] = value.toLowerCase();
+  document.getElementById(`filter-${key}`).value = value;
+}
+
+const WINDOW_SECONDS = 60;
+const TOP_SERIES = 6;
+
+// Stable color per key (IP, domain, ...) so the same value keeps the same
+// color across the scatter, the trend line, and the donuts, tick to tick.
+function colorForKey(key) {
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  return DONUT_COLORS[hash % DONUT_COLORS.length];
+}
+
+function topKeys(items, keyFn, n) {
+  const counts = new Map();
+  for (const item of items) { const k = keyFn(item); counts.set(k, (counts.get(k) || 0) + (item.count || 1)); }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k]) => k);
+}
+
+// The charts need an exact last-60-seconds view, but `events` is capped at
+// MAX_BUFFER for the table's sake — at any real request rate 500 raw events
+// covers far less than 60s, which silently truncated the charts' window.
+// Fixing that means not deriving the charts from that capped list at all:
+// this is a separate store, aggregated incrementally as events arrive and
+// bounded by *time* (~61 one-second buckets, pruned every tick) rather than
+// by event count, so it stays exact regardless of volume.
+//
+// Records are deduplicated per (second, ip, domain, decision, status) — that
+// keeps memory bounded even under heavy load, since it caps at the number of
+// distinct combinations actually seen per second, not the number of requests.
+const buckets = new Map(); // unix second -> Map<key, {ip, domain, decision, status, count}>
+
+function bucketSecond(ev) {
+  return Math.floor(new Date(ev.ts).getTime() / 1000);
+}
+
+function recordToBucket(ev) {
+  const sec = bucketSecond(ev);
+  let bucket = buckets.get(sec);
+  if (!bucket) { bucket = new Map(); buckets.set(sec, bucket); }
+  const key = `${ev.ip}|${ev.domain}|${ev.decision}|${ev.http_status}`;
+  const entry = bucket.get(key);
+  if (entry) entry.count++;
+  else bucket.set(key, { ip: ev.ip, domain: ev.domain, decision: ev.decision, status: ev.http_status, count: 1 });
+}
+
+function pruneBuckets() {
+  const cutoff = Math.floor(Date.now() / 1000) - WINDOW_SECONDS;
+  for (const sec of buckets.keys()) if (sec < cutoff) buckets.delete(sec);
+}
+
+// Flattened, filtered view of the current window. Note: only ip/domain/decision
+// filters apply here (path isn't tracked per-bucket) — the table below still
+// honors the path filter exactly, since it reads the raw per-event buffer.
+function bucketedRecords() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const out = [];
+  for (const [sec, bucket] of buckets) {
+    if (sec < nowSec - WINDOW_SECONDS) continue;
+    for (const r of bucket.values()) {
+      if (filters.ip && !r.ip.toLowerCase().includes(filters.ip)) continue;
+      if (filters.domain && !r.domain.toLowerCase().includes(filters.domain)) continue;
+      if (filters.decision !== 'all' && r.decision !== filters.decision) continue;
+      out.push({ ...r, secAgo: sec - nowSec });
+    }
+  }
+  return out;
+}
+
+function makeBlockedTrendChart(canvasId, titleText) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: { datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      parsing: false,
+      scales: {
+        x: { type: 'linear', min: -WINDOW_SECONDS, max: 0, title: { display: true, text: 'seconds ago', color: '#9aa0aa' }, ticks: { color: '#9aa0aa' }, grid: { color: '#262a33' } },
+        y: { min: 0, beginAtZero: true, ticks: { color: '#9aa0aa', precision: 0 }, grid: { color: '#262a33' } }
+      },
+      plugins: {
+        legend: { position: 'right', labels: { color: '#e6e6e6', boxWidth: 10, font: { size: 9 } } },
+        title: { display: true, text: titleText, color: '#9aa0aa', font: { size: 11 } }
+      }
+    }
+  });
+}
+
+const blockedPerIpChart = makeBlockedTrendChart('chart-blocked-per-ip', 'blocked requests per IP (per second, last 60s)');
+const blockedPerDomainChart = makeBlockedTrendChart('chart-blocked-per-domain', 'blocked requests per domain (per second, last 60s)');
+const requestsPerBackendChart = makeBlockedTrendChart('chart-requests-per-backend', 'requests per backend (per second, last 60s)');
+
+// Shared by all three trend charts: count records per second (optionally
+// pre-filtered, e.g. denied-only), grouped by whichever key (IP, domain,
+// backend), filling zeros so lines actually show decay rather than just
+// stopping.
+function updateCountTrend(chart, records, keyFn, filterFn) {
+  const filtered = filterFn ? records.filter(filterFn) : records;
+  const top = topKeys(filtered, keyFn, TOP_SERIES);
+  const secondsRange = [];
+  for (let s = -WINDOW_SECONDS; s <= 0; s++) secondsRange.push(s);
+
+  chart.data.datasets = top.map(key => {
+    const counts = new Map(secondsRange.map(s => [s, 0]));
+    for (const r of filtered) {
+      if (keyFn(r) !== key) continue;
+      const bucket = Math.max(-WINDOW_SECONDS, Math.min(0, r.secAgo));
+      counts.set(bucket, counts.get(bucket) + r.count);
+    }
+    return {
+      label: key,
+      data: secondsRange.map(s => ({ x: s, y: counts.get(s) })),
+      borderColor: colorForKey(key),
+      backgroundColor: colorForKey(key),
+      tension: 0.15,
+      pointRadius: 0,
+      borderWidth: 2,
+    };
+  });
+  chart.update('none');
+}
+
+function updateBlockedTrend(chart, records, keyFn) {
+  updateCountTrend(chart, records, keyFn, r => r.decision === 'deny');
+}
+
+function makeDonut(canvasId, titleText, filterKey) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels: [], datasets: [{ data: [], backgroundColor: DONUT_COLORS, borderColor: '#1a1d24', borderWidth: 2 }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      onClick: (evt, elements, chart) => {
+        if (!filterKey || !elements.length) return;
+        const label = chart.data.labels[elements[0].index];
+        if (label === 'other') return;
+        // clicking the already-active slice clears the filter (toggle)
+        setFilterInput(filterKey, filters[filterKey] === label.toLowerCase() ? '' : label);
+        tick(); // click feedback shouldn't wait for the next 1s tick
+      },
+      onHover: (evt, elements) => { evt.native.target.style.cursor = elements.length ? 'pointer' : 'default'; },
+      plugins: {
+        legend: { position: 'right', labels: { color: '#e6e6e6', boxWidth: 12, font: { size: 10 } } },
+        title: { display: true, text: titleText, color: '#9aa0aa', font: { size: 11 } }
+      }
+    }
+  });
+}
+
+const ipDonut = makeDonut('donut-ip', 'requests by IP', 'ip');
+const domainDonut = makeDonut('donut-domain', 'requests by domain', 'domain');
+
+// Populated from /api/backends (envoy-control-plane's routes.csv-derived
+// domain -> target:port mapping), refreshed every 5s — not filled in per
+// event, since the scoring pipeline itself (where events originate) has no
+// notion of upstream routing, only envoy-control-plane does.
+let domainToTarget = new Map();
+function targetForDomain(domain) {
+  return domainToTarget.get(domain) || '—';
+}
+
+function updateDonut(chart, records, keyFn, colorFn) {
+  const counts = new Map();
+  for (const r of records) { const k = keyFn(r); counts.set(k, (counts.get(k) || 0) + (r.count || 1)); }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const top = sorted.slice(0, 7);
+  const rest = sorted.slice(7).reduce((sum, [, c]) => sum + c, 0);
+  const labels = top.map(([k]) => k);
+  const data = top.map(([, c]) => c);
+  const colors = top.map(([k]) => (colorFn ? colorFn(k) : null));
+  if (rest > 0) { labels.push('other'); data.push(rest); colors.push('#3f4451'); }
+  chart.data.labels = labels;
+  chart.data.datasets[0].data = data;
+  if (colorFn) chart.data.datasets[0].backgroundColor = colors;
+  chart.update('none');
+}
+
+// Cheap, per-event: stat tiles + the live event table. Kept snappy so new
+// rows show up instantly — this is the "log", not a trend chart.
+function renderTableAndStats() {
+  const filtered = events.filter(matchesFilter);
+
+  const total = filtered.length;
+  const denied = filtered.filter(e => e.decision === 'deny').length;
+  document.getElementById('stat-total').textContent = total;
+  document.getElementById('stat-allow').textContent = total - denied;
+  document.getElementById('stat-deny').textContent = denied;
+  document.getElementById('stat-rate').textContent = total ? Math.round((denied / total) * 100) + '%' : '0%';
+  document.getElementById('filter-count').textContent = `${total} / ${events.length} events shown`;
+
+  const durations = filtered.map(e => e.duration_ms).filter(d => typeof d === 'number').sort((a, b) => a - b);
+  const avgDuration = durations.length ? durations.reduce((s, d) => s + d, 0) / durations.length : 0;
+  const p95Duration = durations.length ? durations[Math.min(durations.length - 1, Math.floor(durations.length * 0.95))] : 0;
+  document.getElementById('stat-avg-duration').textContent = avgDuration.toFixed(1) + 'ms';
+  document.getElementById('stat-p95-duration').textContent = p95Duration.toFixed(1) + 'ms';
+
+  const rows = document.getElementById('rows');
+  rows.innerHTML = '';
+  for (const ev of filtered.slice(-MAX_ROWS).reverse()) {
+    const tr = document.createElement('tr');
+    tr.className = ev.decision;
+    const time = new Date(ev.ts).toLocaleTimeString();
+    const duration = typeof ev.duration_ms === 'number' ? ev.duration_ms.toFixed(1) + 'ms' : '—';
+    // audit mode: decision is the logical verdict, http_status is what
+    // actually happened (always 200) — flag the mismatch explicitly rather
+    // than let "deny" silently mean two different things.
+    const wouldBlock = ev.decision === 'deny' && ev.audit_mode;
+    const decisionText = wouldBlock ? 'deny <span class="audit-tag">(audit)</span>' : ev.decision;
+    tr.innerHTML = `<td>${time}</td><td class="ip">${ev.ip}</td><td>${ev.domain}</td><td>${ev.method}</td><td>${ev.path}</td><td>${ev.user_agent || '—'}</td><td>${ev.http_status}</td><td>${duration}</td><td>${targetForDomain(ev.domain)}</td><td class="decision">${decisionText}</td><td class="reason">${buildReasonCell(ev)}</td>`;
+    rows.appendChild(tr);
+  }
+}
+
+// Every graph on the page redraws here, and only here, on a fixed 1s tick —
+// not once per incoming event. At any real request rate, redrawing on every
+// message made the charts flicker/thrash without adding any information;
+// a steady cadence is what makes a trend actually readable.
+function renderCharts() {
+  pruneBuckets();
+  const records = bucketedRecords();
+
+  updateBlockedTrend(blockedPerIpChart, records, r => r.ip);
+  updateBlockedTrend(blockedPerDomainChart, records, r => r.domain);
+  updateCountTrend(requestsPerBackendChart, records, r => targetForDomain(r.domain));
+  updateDonut(ipDonut, records, r => r.ip, colorForKey);
+  updateDonut(domainDonut, records, r => r.domain, colorForKey);
+}
+
+function tick() {
+  renderTableAndStats();
+  renderCharts();
+}
+
+// addEvent must stay O(1): under real traffic this fires far more than once a
+// second, and it used to call the full table rebuild every time — 1500
+// events in a burst measured ~5.7s of blocked main-thread time, which is
+// what made the whole page (including the chart tick below) stop updating.
+// Rendering is fully decoupled from arrival rate now: buffer here, draw once
+// per tick below, no matter how fast events come in.
+function addEvent(ev) {
+  events.push(ev);
+  if (events.length > MAX_BUFFER) events.shift();
+  recordToBucket(ev);
+}
+
+setInterval(tick, 1000);
+
+// A filter edit is a deliberate action, like a donut click — give it
+// immediate feedback everywhere rather than making it wait for the next tick.
+const onFilterChanged = tick;
+
+document.getElementById('filter-ip').addEventListener('input', e => { filters.ip = e.target.value.toLowerCase(); onFilterChanged(); });
+document.getElementById('filter-path').addEventListener('input', e => { filters.path = e.target.value.toLowerCase(); onFilterChanged(); });
+document.getElementById('filter-domain').addEventListener('input', e => { filters.domain = e.target.value.toLowerCase(); onFilterChanged(); });
+document.getElementById('filter-decision').addEventListener('change', e => { filters.decision = e.target.value; onFilterChanged(); });
+document.getElementById('filter-clear').addEventListener('click', () => {
+  filters.ip = ''; filters.path = ''; filters.domain = ''; filters.decision = 'all';
+  document.getElementById('filter-ip').value = '';
+  document.getElementById('filter-path').value = '';
+  document.getElementById('filter-domain').value = '';
+  document.getElementById('filter-decision').value = 'all';
+  onFilterChanged();
+});
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const ws = new WebSocket(proto + location.host + '/ws');
+  ws.onopen = () => document.getElementById('status').textContent = 'connected';
+  ws.onclose = () => { document.getElementById('status').textContent = 'disconnected, retrying…'; setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (msg) => addEvent(JSON.parse(msg.data));
+}
+function renderConfigBar() {
+  const cfg = window.__ACTIVE_CONFIG__ || {};
+  const onOff = (v) => `<span class="${v ? 'on' : 'off'}">${v ? 'on' : 'off'}</span>`;
+  document.getElementById('config-bar').innerHTML = `
+    <span class="pill">audit mode: ${onOff(cfg.audit_mode)}</span>
+    <span class="pill">risk threshold: <strong>${(cfg.risk_threshold ?? 0).toFixed(2)}</strong></span>
+    <span class="pill">heuristic: ${onOff(cfg.enable_heuristic)}</span>
+    <span class="pill">coraza / CRS: ${onOff(cfg.enable_coraza)} <span id="coraza-live-dot" class="live-dot unknown" title="checking..."></span> <span style="color:#6b7280">(v${cfg.crs_version || '?'}, PL${cfg.crs_paranoia_level || '?'}, fetched ${(cfg.crs_fetched_at || 'unknown').split('T')[0]})</span></span>
+    <span class="pill">crowdsec: ${onOff(cfg.enable_crowdsec)} <span id="crowdsec-live-dot" class="live-dot unknown" title="checking..."></span></span>
+  `;
+}
+renderConfigBar();
+
+// Live connectivity checks, separate from the static "enabled" pills above —
+// scoring-service's own last poll of each tool, not just config state.
+function applyLiveDot(elementId, status, disabledLabel) {
+  const dot = document.getElementById(elementId);
+  if (!dot) return;
+  const s = status || {};
+  if (s.enabled === false) {
+    dot.className = 'live-dot unknown';
+    dot.title = disabledLabel;
+  } else if (s.connected) {
+    dot.className = 'live-dot ok';
+    dot.title = `connected — last poll ${s.last_poll_at || 'unknown'}`;
+  } else {
+    dot.className = 'live-dot down';
+    dot.title = `unreachable — ${s.last_error || 'no successful poll yet'}`;
+  }
+}
+
+async function pollLiveStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    applyLiveDot('crowdsec-live-dot', data.crowdsec, 'crowdsec disabled');
+    applyLiveDot('coraza-live-dot', data.coraza, 'coraza disabled');
+  } catch (e) {
+    applyLiveDot('crowdsec-live-dot', null, '');
+    applyLiveDot('coraza-live-dot', null, '');
+    document.getElementById('crowdsec-live-dot').title = 'dashboard could not reach its own /api/status';
+    document.getElementById('coraza-live-dot').title = 'dashboard could not reach its own /api/status';
+  }
+}
+pollLiveStatus();
+setInterval(pollLiveStatus, 5000);
+
+function truncate(str, n) {
+  return str.length > n ? str.slice(0, n - 1) + '…' : str;
+}
+
+// Chip-and-curve diagram: one rounded chip per fronting domain (left) wired
+// by a smooth curve to one chip per unique target:port (right, deduplicated
+// — several routes.csv rows commonly share one backend). The whole thing is
+// drawn in a fixed logical coordinate space and left to SVG's own viewBox
+// scaling to fit the box, so it never overflows regardless of route count.
+function renderTopology(backends) {
+  const svg = document.getElementById('topology-svg');
+  const empty = document.getElementById('topology-empty');
+  if (!backends || backends.length === 0) {
+    svg.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+
+  const domains = [];
+  const seen = new Set();
+  for (const b of backends) for (const d of (b.domains || [])) if (!seen.has(d)) { seen.add(d); domains.push(d); }
+
+  const rowH = 22, topPad = 10, chipH = 16;
+  const W = 380;
+  const leftX = 4, leftChipW = 128;
+  const rightChipW = 108, rightX = W - rightChipW - 4;
+  const midX1 = leftX + leftChipW, midX2 = rightX;
+  const H = Math.max(domains.length, backends.length) * rowH + topPad * 2;
+
+  const domainY = new Map(domains.map((d, i) => [d, topPad + i * rowH]));
+  const targetY = new Map(backends.map((b, i) => [`${b.target}:${b.port}`, topPad + i * rowH]));
+
+  const parts = [];
+  for (const b of backends) {
+    const key = `${b.target}:${b.port}`;
+    const ty = targetY.get(key) + chipH / 2;
+    const color = b.up ? '#4ade80' : '#f87171';
+    for (const d of (b.domains || [])) {
+      const dy = domainY.get(d) + chipH / 2;
+      const cx = (midX1 + midX2) / 2;
+      parts.push(`<path d="M${midX1},${dy} C${cx},${dy} ${cx},${ty} ${midX2},${ty}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.5" />`);
+    }
+  }
+  for (const d of domains) {
+    const y = domainY.get(d);
+    parts.push(`<rect x="${leftX}" y="${y}" width="${leftChipW}" height="${chipH}" rx="8" fill="#0f1115" stroke="#2a2f3a" />`);
+    parts.push(`<text x="${leftX + leftChipW / 2}" y="${y + chipH / 2 + 3}" font-size="9" fill="#e6e6e6" text-anchor="middle">${escapeHtml(truncate(d, 20))}</text>`);
+  }
+  for (const b of backends) {
+    const key = `${b.target}:${b.port}`;
+    const y = targetY.get(key);
+    const color = b.up ? '#4ade80' : '#f87171';
+    const title = b.up
+      ? `up — checked ${b.checked_at || 'unknown'}`
+      : `down — ${b.error || 'unreachable'}, checked ${b.checked_at || 'unknown'}`;
+    parts.push(`<rect x="${rightX}" y="${y}" width="${rightChipW}" height="${chipH}" rx="8" fill="#0f1115" stroke="${color}" stroke-width="1.3"><title>${escapeHtml(title)}</title></rect>`);
+    parts.push(`<circle cx="${rightX + 10}" cy="${y + chipH / 2}" r="3" fill="${color}" />`);
+    parts.push(`<text x="${rightX + 18}" y="${y + chipH / 2 + 3}" font-size="9" fill="#e6e6e6">${escapeHtml(truncate(key, 14))}</text>`);
+  }
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.innerHTML = parts.join('');
+}
+
+async function pollBackends() {
+  try {
+    const res = await fetch('/api/backends');
+    const data = await res.json();
+    const backends = data.backends || [];
+    domainToTarget = new Map();
+    for (const b of backends) for (const d of (b.domains || [])) domainToTarget.set(d, `${b.target}:${b.port}`);
+    renderTopology(backends);
+  } catch (e) {
+    renderTopology([]);
+  }
+}
+pollBackends();
+setInterval(pollBackends, 5000);
+
+connect();
+tick();
+</script>
+</body>
+</html>

@@ -1,0 +1,872 @@
+// envoy-control-plane is a small xDS (ADS) server: it watches routes.csv and
+// the ssl/ certificate directory, and pushes a fresh Envoy config snapshot
+// (listeners, routes, clusters) to Envoy over gRPC whenever either changes —
+// no Envoy restart needed. This is what makes envoy.yaml's dynamic_resources
+// possible; a CSV file alone means nothing to Envoy, it only speaks its own
+// typed xDS protocol.
+package main
+
+import (
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	streamaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/stream/v3"
+	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	tlsinspectorv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	quicv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/quic/v3"
+	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
+	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	"github.com/fsnotify/fsnotify"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+const nodeID = "envoy-node-1"
+
+// Request-handling limits/timeouts, set once in main() from .env (see
+// envOr/envOrDuration) and read from every builder function below — package
+// level rather than threaded through every function signature since they're
+// fixed for the process lifetime, same treatment as nodeID above.
+var (
+	extAuthzTimeout      time.Duration // how long the ext_authz scoring check itself may take
+	extAuthzMaxBodyBytes uint32        // how much of the request body is buffered and handed to scoring-service for inspection
+	upstreamConnTimeout  time.Duration // TCP connect timeout to any upstream (scoring-service, default-site, routes.csv targets)
+	requestTimeout       time.Duration // overall per-request timeout (RouteAction) — Envoy's own default is 15s if unset
+	streamIdleTimeout    time.Duration // how long a stream may go fully silent before Envoy resets it — matters for long-lived SSE responses
+)
+
+type route struct {
+	ID        string
+	Domain    string
+	Target    string
+	Port      int
+	SSL       bool
+	CertCheck bool
+	Scoring   bool
+}
+
+func parseBool(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), "true")
+}
+
+// loadRoutes reads routes.csv. A malformed row is skipped with a warning
+// rather than taking down the whole config — one typo in one line shouldn't
+// break every other domain.
+func loadRoutes(path string) ([]route, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	var routes []route
+	for i, rec := range records[1:] { // skip header
+		if len(rec) < 7 {
+			log.Printf("routes.csv line %d: expected 7 columns, got %d, skipping", i+2, len(rec))
+			continue
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(rec[3]))
+		if err != nil {
+			log.Printf("routes.csv line %d: invalid port %q, skipping", i+2, rec[3])
+			continue
+		}
+		routes = append(routes, route{
+			ID:        strings.TrimSpace(rec[0]),
+			Domain:    strings.TrimSpace(rec[1]),
+			Target:    strings.TrimSpace(rec[2]),
+			Port:      port,
+			SSL:       parseBool(rec[4]),
+			CertCheck: parseBool(rec[5]),
+			Scoring:   parseBool(rec[6]),
+		})
+	}
+	return routes, nil
+}
+
+// targetHealth is one target:port's most recent TCP-reachability check — a
+// plain connect probe, not an HTTP health check, since each target's actual
+// health endpoint (if any) is unknown to this service; "accepts a TCP
+// connection" is what "backend availability" means here.
+type targetHealth struct {
+	Up        bool
+	CheckedAt time.Time
+	Err       string
+}
+
+type backendStatus struct {
+	Target    string   `json:"target"`
+	Port      int      `json:"port"`
+	Up        bool     `json:"up"`
+	CheckedAt string   `json:"checked_at,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Domains   []string `json:"domains"` // every routes.csv domain fronting this target:port — display only, the probe itself stays deduped per target:port
+}
+
+// healthChecker polls every unique target:port on a fixed interval and
+// serves the last-known results over HTTP — dashboard polls that endpoint
+// rather than probing backends itself (it has no network path to them).
+// Keyed by target:port, not by route/domain: several routes.csv rows
+// commonly share one backend, and checking (and displaying) the same
+// connection once per fronting domain would just be redundant noise.
+type healthChecker struct {
+	mu      sync.RWMutex
+	routes  []route
+	results map[string]targetHealth // keyed by "target:port"
+}
+
+func newHealthChecker() *healthChecker {
+	return &healthChecker{results: make(map[string]targetHealth)}
+}
+
+// setRoutes is called every time routes.csv reloads, so newly added routes
+// get probed and removed ones stop being reported.
+func (h *healthChecker) setRoutes(routes []route) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.routes = routes
+}
+
+func (h *healthChecker) checkOnce() {
+	h.mu.RLock()
+	routes := append([]route(nil), h.routes...)
+	h.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	for _, r := range routes {
+		addr := net.JoinHostPort(r.Target, strconv.Itoa(r.Port))
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+
+		result := targetHealth{CheckedAt: time.Now().UTC()}
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			result.Err = err.Error()
+		} else {
+			result.Up = true
+			conn.Close()
+		}
+		h.mu.Lock()
+		h.results[addr] = result
+		h.mu.Unlock()
+	}
+}
+
+func (h *healthChecker) run(ctx context.Context, interval time.Duration) {
+	h.checkOnce()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.checkOnce()
+		}
+	}
+}
+
+func (h *healthChecker) snapshot() []backendStatus {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	order := make([]string, 0, len(h.routes))
+	domains := make(map[string][]string)
+	for _, r := range h.routes {
+		addr := net.JoinHostPort(r.Target, strconv.Itoa(r.Port))
+		if _, ok := domains[addr]; !ok {
+			order = append(order, addr)
+		}
+		domains[addr] = append(domains[addr], r.Domain)
+	}
+
+	out := make([]backendStatus, 0, len(order))
+	for _, addr := range order {
+		target, portStr, _ := net.SplitHostPort(addr)
+		port, _ := strconv.Atoi(portStr)
+		res := h.results[addr]
+		status := backendStatus{Target: target, Port: port, Up: res.Up, Error: res.Err, Domains: domains[addr]}
+		if !res.CheckedAt.IsZero() {
+			status.CheckedAt = res.CheckedAt.Format(time.RFC3339)
+		}
+		out = append(out, status)
+	}
+	return out
+}
+
+func (h *healthChecker) handler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"backends": h.snapshot()})
+}
+
+func mustAny(msg proto.Message) *anypb.Any {
+	a, err := anypb.New(msg)
+	if err != nil {
+		log.Fatalf("marshaling %T: %v", msg, err)
+	}
+	return a
+}
+
+func exactMatcher(values ...string) *matcherv3.ListStringMatcher {
+	patterns := make([]*matcherv3.StringMatcher, len(values))
+	for i, v := range values {
+		patterns[i] = &matcherv3.StringMatcher{MatchPattern: &matcherv3.StringMatcher_Exact{Exact: v}}
+	}
+	return &matcherv3.ListStringMatcher{Patterns: patterns}
+}
+
+// buildExtAuthzFilter mirrors the ext_authz http_service block that used to
+// be hand-written in envoy.yaml — same allowed headers, same fail-closed
+// behavior, same scoring-service target.
+func buildExtAuthzFilter() *hcmv3.HttpFilter {
+	cfg := &extauthzv3.ExtAuthz{
+		TransportApiVersion: corev3.ApiVersion_V3,
+		FailureModeAllow:    false,
+		Services: &extauthzv3.ExtAuthz_HttpService{
+			HttpService: &extauthzv3.HttpService{
+				ServerUri: &corev3.HttpUri{
+					Uri:              "http://scoring-service:8001",
+					HttpUpstreamType: &corev3.HttpUri_Cluster{Cluster: "scoring_service"},
+					Timeout:          durationpb.New(extAuthzTimeout),
+				},
+				PathPrefix: "/check",
+				AuthorizationRequest: &extauthzv3.AuthorizationRequest{
+					AllowedHeaders: exactMatcher("user-agent", "x-forwarded-for", "x-envoy-external-address", ":authority", "content-type"),
+				},
+				AuthorizationResponse: &extauthzv3.AuthorizationResponse{
+					AllowedUpstreamHeaders: exactMatcher("x-risk-score", "x-audit-would-block"),
+				},
+			},
+		},
+		WithRequestBody: &extauthzv3.BufferSettings{
+			MaxRequestBytes:     extAuthzMaxBodyBytes,
+			AllowPartialMessage: true,
+		},
+	}
+	return &hcmv3.HttpFilter{
+		Name:       "envoy.filters.http.ext_authz",
+		ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(cfg)},
+	}
+}
+
+func buildRouterFilter() *hcmv3.HttpFilter {
+	// SuppressEnvoyHeaders: drop x-envoy-* internals (upstream service time,
+	// original path, etc.) from responses — no reason to expose proxy
+	// internals to clients outside this demo.
+	cfg := &routerv3.Router{SuppressEnvoyHeaders: true}
+	return &hcmv3.HttpFilter{
+		Name:       wellknown.Router,
+		ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(cfg)},
+	}
+}
+
+// buildLocalReplyConfig mirrors the branded 403/5xx error pages, same as the
+// old static envoy.yaml — read from disk by Envoy itself at response time,
+// so no mount is needed on envoy-control-plane's side for these. Each status
+// range has two variants, JSON and HTML; the JSON one only matches when the
+// client's Accept header asks for it, so mapper order matters — Envoy uses
+// the first matching entry, so the more specific (status + Accept) mappers
+// must come before the plain-status HTML fallback for the same range.
+func buildLocalReplyConfig() *hcmv3.LocalReplyConfig {
+	statusFilter := func(op accesslogv3.ComparisonFilter_Op, value uint32, runtimeKey string) *accesslogv3.AccessLogFilter {
+		return &accesslogv3.AccessLogFilter{
+			FilterSpecifier: &accesslogv3.AccessLogFilter_StatusCodeFilter{
+				StatusCodeFilter: &accesslogv3.StatusCodeFilter{
+					Comparison: &accesslogv3.ComparisonFilter{
+						Op:    op,
+						Value: &corev3.RuntimeUInt32{DefaultValue: value, RuntimeKey: runtimeKey},
+					},
+				},
+			},
+		}
+	}
+	acceptsJSON := &accesslogv3.AccessLogFilter{
+		FilterSpecifier: &accesslogv3.AccessLogFilter_HeaderFilter{
+			HeaderFilter: &accesslogv3.HeaderFilter{
+				Header: &routev3.HeaderMatcher{
+					Name: "accept",
+					HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
+						StringMatch: &matcherv3.StringMatcher{
+							MatchPattern: &matcherv3.StringMatcher_Contains{Contains: "application/json"},
+						},
+					},
+				},
+			},
+		},
+	}
+	and := func(filters ...*accesslogv3.AccessLogFilter) *accesslogv3.AccessLogFilter {
+		return &accesslogv3.AccessLogFilter{
+			FilterSpecifier: &accesslogv3.AccessLogFilter_AndFilter{AndFilter: &accesslogv3.AndFilter{Filters: filters}},
+		}
+	}
+	mapper := func(filter *accesslogv3.AccessLogFilter, file, contentType string) *hcmv3.ResponseMapper {
+		return &hcmv3.ResponseMapper{
+			Filter: filter,
+			Body:   &corev3.DataSource{Specifier: &corev3.DataSource_Filename{Filename: file}},
+			HeadersToAdd: []*corev3.HeaderValueOption{
+				{Header: &corev3.HeaderValue{Key: "content-type", Value: contentType}},
+			},
+		}
+	}
+	return &hcmv3.LocalReplyConfig{
+		Mappers: []*hcmv3.ResponseMapper{
+			mapper(and(statusFilter(accesslogv3.ComparisonFilter_EQ, 403, "local_reply_403_json"), acceptsJSON),
+				"/etc/envoy/error_pages/403.json", "application/json; charset=utf-8"),
+			mapper(and(statusFilter(accesslogv3.ComparisonFilter_GE, 500, "local_reply_5xx_json"), acceptsJSON),
+				"/etc/envoy/error_pages/5xx.json", "application/json; charset=utf-8"),
+			mapper(statusFilter(accesslogv3.ComparisonFilter_EQ, 403, "local_reply_403"),
+				"/etc/envoy/error_pages/403.html", "text/html; charset=utf-8"),
+			mapper(statusFilter(accesslogv3.ComparisonFilter_GE, 500, "local_reply_5xx"),
+				"/etc/envoy/error_pages/5xx.html", "text/html; charset=utf-8"),
+		},
+	}
+}
+
+// headerOpt builds an always-wins response header: OVERWRITE_IF_EXISTS_OR_ADD
+// so our hardening value replaces whatever an upstream (nginx, the echo
+// backend...) sent, rather than just appending a second copy.
+func headerOpt(key, value string) *corev3.HeaderValueOption {
+	return &corev3.HeaderValueOption{
+		Header:       &corev3.HeaderValue{Key: key, Value: value},
+		AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+	}
+}
+
+// baseSecurityHeaders applies regardless of scheme: MIME sniffing off,
+// disallow framing (no legitimate reason to iframe this demo), a
+// conservative Referrer-Policy, and a Permissions-Policy that opts out of
+// powerful features this proxy has no business granting to any backend.
+func baseSecurityHeaders() []*corev3.HeaderValueOption {
+	return []*corev3.HeaderValueOption{
+		headerOpt("x-content-type-options", "nosniff"),
+		headerOpt("x-frame-options", "DENY"),
+		headerOpt("referrer-policy", "strict-origin-when-cross-origin"),
+		headerOpt("permissions-policy", "camera=(), microphone=(), geolocation=()"),
+	}
+}
+
+// buildHTTPConnectionManager is shared by both listeners but not identical:
+// HSTS only makes sense advertised over a connection that's already TLS —
+// sending it over plain HTTP doesn't upgrade anything and just adds noise.
+// routeConfigNameHTTP/HTTPS: response security headers (including HSTS,
+// HTTPS-only) live on the RouteConfiguration, not the HCM — see
+// buildRouteConfig — so each listener's HCM points at its own named
+// resource even though the VirtualHosts inside are otherwise identical.
+const (
+	routeConfigNameHTTP  = "main_routes_http"
+	routeConfigNameHTTPS = "main_routes_https"
+)
+
+func buildHTTPConnectionManager(routeConfigName string) *hcmv3.HttpConnectionManager {
+	return &hcmv3.HttpConnectionManager{
+		StatPrefix:        "ingress_http",
+		UseRemoteAddress:  wrapperspb.Bool(true),
+		LocalReplyConfig:  buildLocalReplyConfig(),
+		StreamIdleTimeout: durationpb.New(streamIdleTimeout),
+		AccessLog: []*accesslogv3.AccessLog{
+			{
+				Name: "envoy.access_loggers.stdout",
+				ConfigType: &accesslogv3.AccessLog_TypedConfig{
+					TypedConfig: mustAny(&streamaccesslogv3.StdoutAccessLog{}),
+				},
+			},
+		},
+		RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{
+			Rds: &hcmv3.Rds{
+				RouteConfigName: routeConfigName,
+				ConfigSource: &corev3.ConfigSource{
+					ResourceApiVersion:   corev3.ApiVersion_V3,
+					ConfigSourceSpecifier: &corev3.ConfigSource_Ads{Ads: &corev3.AggregatedConfigSource{}},
+				},
+			},
+		},
+		HttpFilters: []*hcmv3.HttpFilter{buildExtAuthzFilter(), buildRouterFilter()},
+	}
+}
+
+func buildListenerHTTP(port uint32) *listenerv3.Listener {
+	hcm := buildHTTPConnectionManager(routeConfigNameHTTP)
+	return &listenerv3.Listener{
+		Name: "listener_http",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
+			Address:       "0.0.0.0",
+			PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+		}}},
+		FilterChains: []*listenerv3.FilterChain{{
+			Filters: []*listenerv3.Filter{{
+				Name:       wellknown.HTTPConnectionManager,
+				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: mustAny(hcm)},
+			}},
+		}},
+	}
+}
+
+// buildListenerHTTPS returns nil (no listener at all) if no route has
+// ssl=true and a usable cert — LDS removes the resource entirely rather than
+// publish a TLS listener with zero filter chains, which Envoy would reject.
+func buildListenerHTTPS(port uint32, routes []route, sslDir string) *listenerv3.Listener {
+	hcm := buildHTTPConnectionManager(routeConfigNameHTTPS)
+	var chains []*listenerv3.FilterChain
+	for _, r := range routes {
+		if !r.SSL {
+			continue
+		}
+		crt := filepath.Join(sslDir, r.Domain+".crt")
+		key := filepath.Join(sslDir, r.Domain+".key")
+		// Read and embed the actual bytes (DataSource_InlineBytes) rather than
+		// pass a DataSource_Filename path for Envoy to read itself: with a
+		// filename reference, replacing a cert's *content* in place (same
+		// domain, renewed cert) produces a byte-identical Listener proto —
+		// nothing for LDS to diff — so Envoy never re-reads the file and
+		// keeps serving the stale cert indefinitely. Inlining the bytes here
+		// means a changed cert changes the proto itself, which is exactly
+		// what the existing ssl/ fsnotify watcher (see generator.watch) is
+		// already triggering a rebuild for.
+		crtBytes, err := os.ReadFile(crt)
+		if err != nil {
+			log.Printf("route %s (%s): ssl=true but couldn't read cert at %s, skipping — run generate-cert.sh %s: %v", r.ID, r.Domain, crt, r.Domain, err)
+			continue
+		}
+		keyBytes, err := os.ReadFile(key)
+		if err != nil {
+			log.Printf("route %s (%s): ssl=true but couldn't read key at %s, skipping: %v", r.ID, r.Domain, key, err)
+			continue
+		}
+
+		downstreamTLS := &tlsv3.DownstreamTlsContext{
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				// Explicit floor rather than relying on Envoy's own compiled-in
+				// default: TLS 1.0/1.1 are both formally deprecated (RFC 8996)
+				// and this pins the demo to 1.2+ regardless of what future
+				// Envoy versions default to.
+				TlsParams: &tlsv3.TlsParameters{
+					TlsMinimumProtocolVersion: tlsv3.TlsParameters_TLSv1_2,
+					TlsMaximumProtocolVersion: tlsv3.TlsParameters_TLSv1_3,
+				},
+				TlsCertificates: []*tlsv3.TlsCertificate{{
+					CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: crtBytes}},
+					PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: keyBytes}},
+				}},
+			},
+		}
+		chains = append(chains, &listenerv3.FilterChain{
+			FilterChainMatch: &listenerv3.FilterChainMatch{ServerNames: []string{r.Domain}},
+			TransportSocket: &corev3.TransportSocket{
+				Name:       "envoy.transport_sockets.tls",
+				ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(downstreamTLS)},
+			},
+			Filters: []*listenerv3.Filter{{
+				Name:       wellknown.HTTPConnectionManager,
+				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: mustAny(hcm)},
+			}},
+		})
+	}
+	if len(chains) == 0 {
+		return nil
+	}
+	return &listenerv3.Listener{
+		Name: "listener_https",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
+			Address:       "0.0.0.0",
+			PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+		}}},
+		ListenerFilters: []*listenerv3.ListenerFilter{{
+			Name:       "envoy.filters.listener.tls_inspector",
+			ConfigType: &listenerv3.ListenerFilter_TypedConfig{TypedConfig: mustAny(&tlsinspectorv3.TlsInspector{})},
+		}},
+		FilterChains: chains,
+	}
+}
+
+// buildListenerHTTPSQuic is HTTP/3: a UDP listener on the *same* port number
+// as the TCP HTTPS listener above, advertised to clients via the alt-svc
+// response header (see apply()) — that's the standard discovery mechanism,
+// browsers/curl try QUIC on that port after seeing it on an HTTPS response,
+// they don't guess. Same domains/certs/routes as the TCP listener; no
+// tls_inspector (that's TCP-only — QUIC's own initial packet already
+// carries SNI, Envoy parses it natively) and no explicit TlsParams (QUIC
+// mandates TLS 1.3, there's nothing to pin).
+func buildListenerHTTPSQuic(port uint32, routes []route, sslDir string) *listenerv3.Listener {
+	hcm := buildHTTPConnectionManager(routeConfigNameHTTPS)
+	hcm.CodecType = hcmv3.HttpConnectionManager_HTTP3 // required on a QUIC listener — AUTO (the default) doesn't include HTTP/3 detection
+	var chains []*listenerv3.FilterChain
+	for _, r := range routes {
+		if !r.SSL {
+			continue
+		}
+		crtBytes, err := os.ReadFile(filepath.Join(sslDir, r.Domain+".crt"))
+		if err != nil {
+			continue // buildListenerHTTPS already logs the missing-cert case for this tick
+		}
+		keyBytes, err := os.ReadFile(filepath.Join(sslDir, r.Domain+".key"))
+		if err != nil {
+			continue
+		}
+
+		quicTransport := &quicv3.QuicDownstreamTransport{
+			DownstreamTlsContext: &tlsv3.DownstreamTlsContext{
+				CommonTlsContext: &tlsv3.CommonTlsContext{
+					TlsCertificates: []*tlsv3.TlsCertificate{{
+						CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: crtBytes}},
+						PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: keyBytes}},
+					}},
+				},
+			},
+		}
+		chains = append(chains, &listenerv3.FilterChain{
+			FilterChainMatch: &listenerv3.FilterChainMatch{ServerNames: []string{r.Domain}},
+			TransportSocket: &corev3.TransportSocket{
+				Name:       "envoy.transport_sockets.quic",
+				ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(quicTransport)},
+			},
+			Filters: []*listenerv3.Filter{{
+				Name:       wellknown.HTTPConnectionManager,
+				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: mustAny(hcm)},
+			}},
+		})
+	}
+	if len(chains) == 0 {
+		return nil
+	}
+	return &listenerv3.Listener{
+		Name: "listener_https_quic",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
+			Protocol:      corev3.SocketAddress_UDP,
+			Address:       "0.0.0.0",
+			PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+		}}},
+		UdpListenerConfig: &listenerv3.UdpListenerConfig{QuicOptions: &listenerv3.QuicProtocolOptions{}},
+		EnableReusePort:   wrapperspb.Bool(true),
+		FilterChains:      chains,
+	}
+}
+
+func buildStaticCluster(name, address string, port uint32) *clusterv3.Cluster {
+	return &clusterv3.Cluster{
+		Name:                 name,
+		ConnectTimeout:       durationpb.New(upstreamConnTimeout),
+		ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STRICT_DNS},
+		LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+		LoadAssignment: &endpointv3.ClusterLoadAssignment{
+			ClusterName: name,
+			Endpoints: []*endpointv3.LocalityLbEndpoints{{
+				LbEndpoints: []*endpointv3.LbEndpoint{{
+					HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+						Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
+							Address:       address,
+							PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+						}}},
+					}},
+				}},
+			}},
+		},
+	}
+}
+
+// buildRouteCluster builds the upstream cluster for one routes.csv row. All
+// CSV targets are connected to over HTTPS (that's what makes cert_check
+// meaningful); cert_check=false trusts whatever cert the backend presents
+// (self-signed/unknown CA), cert_check=true requires it validate normally.
+func buildRouteCluster(r route) *clusterv3.Cluster {
+	c := buildStaticCluster("cluster_"+r.ID, r.Target, uint32(r.Port))
+	validationContext := &tlsv3.CertificateValidationContext{
+		TrustChainVerification: tlsv3.CertificateValidationContext_ACCEPT_UNTRUSTED,
+	}
+	if r.CertCheck {
+		// ACCEPT_UNTRUSTED skips verification outright; VERIFY_TRUST_CHAIN by
+		// itself has nothing to verify against without an explicit CA bundle
+		// — it's a silent no-op, not a stricter mode. The system bundle is
+		// what the Envoy image ships for this purpose.
+		validationContext.TrustChainVerification = tlsv3.CertificateValidationContext_VERIFY_TRUST_CHAIN
+		validationContext.TrustedCa = &corev3.DataSource{
+			Specifier: &corev3.DataSource_Filename{Filename: "/etc/ssl/certs/ca-certificates.crt"},
+		}
+	}
+	upstreamTLS := &tlsv3.UpstreamTlsContext{
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			TlsParams: &tlsv3.TlsParameters{
+				TlsMinimumProtocolVersion: tlsv3.TlsParameters_TLSv1_2,
+				TlsMaximumProtocolVersion: tlsv3.TlsParameters_TLSv1_3,
+			},
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: validationContext,
+			},
+		},
+		Sni: r.Domain,
+	}
+	c.TransportSocket = &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(upstreamTLS)},
+	}
+	return c
+}
+
+// buildRouteConfig is called once per listener (name/headers differ) rather
+// than shared, so HSTS can be scoped to the HTTPS route config only —
+// sending it over the plain HTTP listener wouldn't be dangerous (browsers
+// ignore Strict-Transport-Security on a non-HTTPS response per RFC 6797) but
+// there's no reason to send it there either.
+func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.HeaderValueOption) *routev3.RouteConfiguration {
+	var vhosts []*routev3.VirtualHost
+	for _, r := range routes {
+		vh := &routev3.VirtualHost{
+			Name:    "vh_" + r.ID,
+			// Both forms: a client on a non-default port (e.g. our TLS demo
+			// port 10443) sends "Host: domain:port", which won't exact-match
+			// a bare domain entry — the ":*" suffix is Envoy's documented
+			// wildcard for "this domain on any port".
+			Domains: []string{r.Domain, r.Domain + ":*"},
+			Routes: []*routev3.Route{{
+				Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
+				Action: &routev3.Route_Route{Route: &routev3.RouteAction{
+					ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "cluster_" + r.ID},
+					Timeout:          durationpb.New(requestTimeout),
+				}},
+			}},
+		}
+		if !r.Scoring {
+			vh.Routes[0].TypedPerFilterConfig = map[string]*anypb.Any{
+				"envoy.filters.http.ext_authz": mustAny(&extauthzv3.ExtAuthzPerRoute{
+					Override: &extauthzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+				}),
+			}
+		}
+		vhosts = append(vhosts, vh)
+	}
+	vhosts = append(vhosts, &routev3.VirtualHost{
+		Name:    "vh_default",
+		Domains: []string{"*"},
+		Routes: []*routev3.Route{{
+			Match:  &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
+			Action: &routev3.Route_Route{Route: &routev3.RouteAction{
+				ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "default_site"},
+				Timeout:          durationpb.New(requestTimeout),
+			}},
+		}},
+	})
+	return &routev3.RouteConfiguration{Name: name, VirtualHosts: vhosts, ResponseHeadersToAdd: responseHeaders}
+}
+
+type generator struct {
+	csvPath   string
+	sslDir    string
+	httpPort  uint32
+	httpsPort uint32
+	cache     cachev3.SnapshotCache
+	version   int64
+	health    *healthChecker
+}
+
+func (g *generator) rebuild(ctx context.Context) error {
+	routes, err := loadRoutes(g.csvPath)
+	if err != nil {
+		return fmt.Errorf("loading %s: %w", g.csvPath, err)
+	}
+	return g.apply(ctx, routes)
+}
+
+// apply turns a parsed routes.csv into a full xDS snapshot (clusters, one
+// shared route config, HTTP + optional HTTPS listeners) and pushes it. Every
+// route shares the same ext_authz-gated HTTP connection manager — the CSV
+// only varies routing/TLS/cert-verification/scoring-toggle per domain, the
+// actual scoring pipeline is identical either way.
+func (g *generator) apply(ctx context.Context, routes []route) error {
+	g.health.setRoutes(routes)
+
+	clusters := []cachetypes.Resource{
+		buildStaticCluster("scoring_service", "scoring-service", 8001),
+		buildStaticCluster("default_site", "default-site", 80),
+	}
+	for _, r := range routes {
+		clusters = append(clusters, buildRouteCluster(r))
+	}
+
+	listeners := []cachetypes.Resource{buildListenerHTTP(g.httpPort)}
+	if httpsListener := buildListenerHTTPS(g.httpsPort, routes, g.sslDir); httpsListener != nil {
+		listeners = append(listeners, httpsListener)
+	}
+	if quicListener := buildListenerHTTPSQuic(g.httpsPort, routes, g.sslDir); quicListener != nil {
+		listeners = append(listeners, quicListener)
+	}
+
+	httpsHeaders := append(append([]*corev3.HeaderValueOption{}, baseSecurityHeaders()...),
+		headerOpt("strict-transport-security", "max-age=31536000; includeSubDomains"),
+		// Tells clients HTTP/3 is available on the same port over UDP — this is
+		// how they discover it; nothing about the TCP/TLS listener itself
+		// implies a QUIC listener exists alongside it.
+		headerOpt("alt-svc", fmt.Sprintf(`h3=":%d"; ma=86400`, g.httpsPort)))
+	routeConfigs := []cachetypes.Resource{
+		buildRouteConfig(routes, routeConfigNameHTTP, baseSecurityHeaders()),
+		buildRouteConfig(routes, routeConfigNameHTTPS, httpsHeaders),
+	}
+
+	version := atomic.AddInt64(&g.version, 1)
+	snapshot, err := cachev3.NewSnapshot(
+		strconv.FormatInt(version, 10),
+		map[resourcev3.Type][]cachetypes.Resource{
+			resourcev3.ClusterType:  clusters,
+			resourcev3.RouteType:    routeConfigs,
+			resourcev3.ListenerType: listeners,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("building snapshot: %w", err)
+	}
+	if err := snapshot.Consistent(); err != nil {
+		return fmt.Errorf("inconsistent snapshot: %w", err)
+	}
+	if err := g.cache.SetSnapshot(ctx, nodeID, snapshot); err != nil {
+		return fmt.Errorf("setting snapshot: %w", err)
+	}
+	log.Printf("applied config: %d route(s), %d cluster(s), %d listener(s), version %d", len(routes), len(clusters), len(listeners), version)
+	return nil
+}
+
+func main() {
+	csvPath := envOr("ROUTES_CSV", "/etc/envoy-cp/routes.csv")
+	sslDir := envOr("SSL_DIR", "/etc/envoy-cp/ssl")
+	httpPort := envOrInt("ENVOY_HTTP_PORT", 10000)
+	httpsPort := envOrInt("ENVOY_HTTPS_PORT", 10443)
+	listenAddr := envOr("LISTEN_ADDR", ":18000")
+	healthAddr := envOr("HEALTH_LISTEN_ADDR", ":18001")
+
+	extAuthzTimeout = time.Duration(envOrInt("EXT_AUTHZ_TIMEOUT_MS", 200)) * time.Millisecond
+	extAuthzMaxBodyBytes = uint32(envOrInt("EXT_AUTHZ_MAX_BODY_BYTES", 8192))
+	upstreamConnTimeout = time.Duration(envOrInt("UPSTREAM_CONNECT_TIMEOUT_MS", 1000)) * time.Millisecond
+	requestTimeout = time.Duration(envOrInt("REQUEST_TIMEOUT_S", 15)) * time.Second
+	streamIdleTimeout = time.Duration(envOrInt("STREAM_IDLE_TIMEOUT_S", 300)) * time.Second
+
+	snapshotCache := cachev3.NewSnapshotCache(true, cachev3.IDHash{}, nil)
+
+	g := &generator{
+		csvPath:   csvPath,
+		sslDir:    sslDir,
+		httpPort:  uint32(httpPort),
+		httpsPort: uint32(httpsPort),
+		cache:     snapshotCache,
+		health:    newHealthChecker(),
+	}
+
+	ctx := context.Background()
+	if err := g.rebuild(ctx); err != nil {
+		log.Fatalf("initial config build failed: %v", err)
+	}
+
+	go g.watch(ctx)
+	go g.health.run(ctx, 5*time.Second)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/routes/health", g.health.handler)
+	go func() {
+		log.Printf("backend health endpoint listening on %s (/routes/health)", healthAddr)
+		if err := http.ListenAndServe(healthAddr, mux); err != nil {
+			log.Fatalf("health HTTP server failed: %v", err)
+		}
+	}()
+
+	xdsServer := serverv3.NewServer(ctx, snapshotCache, nil)
+	grpcServer := grpc.NewServer()
+	discoverygrpc.RegisterAggregatedDiscoveryServiceServer(grpcServer, xdsServer)
+
+	lis, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("failed to listen on %s: %v", listenAddr, err)
+	}
+	log.Printf("envoy-control-plane (ADS) listening on %s, watching %s and %s", listenAddr, csvPath, sslDir)
+	log.Fatal(grpcServer.Serve(lis))
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envOrInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func (g *generator) watch(ctx context.Context) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("fsnotify unavailable, dynamic reload disabled: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(filepath.Dir(g.csvPath)); err != nil {
+		log.Printf("failed to watch %s: %v", filepath.Dir(g.csvPath), err)
+	}
+	if err := os.MkdirAll(g.sslDir, 0o755); err == nil {
+		if err := watcher.Add(g.sslDir); err != nil {
+			log.Printf("failed to watch %s: %v", g.sslDir, err)
+		}
+	}
+
+	var debounce *time.Timer
+	for {
+		select {
+		case _, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if debounce != nil {
+				debounce.Stop()
+			}
+			debounce = time.AfterFunc(300*time.Millisecond, func() {
+				if err := g.rebuild(ctx); err != nil {
+					log.Printf("config rebuild failed, keeping previous snapshot: %v", err)
+				}
+			})
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("fsnotify error: %v", err)
+		}
+	}
+}
