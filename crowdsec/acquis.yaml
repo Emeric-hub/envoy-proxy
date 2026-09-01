@@ -2,3 +2,14 @@ filenames:
   - /var/log/crowdsec-feed/access.log
 labels:
   type: nginx
+---
+# Fed by scoring-service/app/crowdsec_client.py's log_modsec_matches_for_crowdsec
+# — ModSecurity-format error-log lines built from Coraza/CRS's own matched
+# rules. type: modsecurity (not 'syslog'/'unifi') routes this through
+# crowdsecurity/non-syslog, which sets evt.Parsed.program = the label value
+# directly — no real syslog envelope needed, just the raw ModSecurity-style
+# line — before crowdsecurity/modsecurity's own parser picks it up.
+filenames:
+  - /var/log/crowdsec-feed/modsecurity.log
+labels:
+  type: modsecurity

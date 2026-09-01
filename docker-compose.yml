@@ -53,14 +53,16 @@ services:
       - "18001"
 
   scoring-service:
-    build: ./scoring-service
+    build: ./scoring-service-go
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CORAZA_URL=http://coraza-service:8003/check
       - RISK_THRESHOLD=${RISK_THRESHOLD:-0.8}
       - AUDIT_MODE=${AUDIT_MODE:-false}
       - ENABLE_CORAZA=${ENABLE_CORAZA:-true}
-      - ENABLE_HEURISTIC=${ENABLE_HEURISTIC:-true}
+      - ENABLE_AI_TUNER=${ENABLE_AI_TUNER:-true}
+      - AI_TUNER_MIN_SEVERITY_CODE=${AI_TUNER_MIN_SEVERITY_CODE:-3}
+      - AI_TUNER_INELIGIBLE_TAGS=${AI_TUNER_INELIGIBLE_TAGS:-attack-sqli,attack-xss,attack-rce,attack-lfi,attack-rfi,attack-php-injection,attack-nodejs-injection,attack-session-fixation,attack-reputation-scanner,attack-disclosure,attack-injection-generic}
       - ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-true}
       - CROWDSEC_URL=http://crowdsec:8080
       - CROWDSEC_API_KEY=${CROWDSEC_BOUNCER_KEY:-devbouncerkeychangeme}
@@ -69,11 +71,12 @@ services:
       - ./crowdsec/feed:/var/log/crowdsec-feed
     expose:
       - "8001"
+      - "9001"
     depends_on:
       redis:
         condition: service_started
       # required: false — coraza-service/crowdsec are profile-gated (see
-      # COMPOSE_PROFILES in .env) and may not be running at all. scoring.py
+      # COMPOSE_PROFILES in .env) and may not be running at all. main.go
       # already handles either one being unreachable the same way it handles
       # ENABLE_CORAZA/ENABLE_CROWDSEC=false: skip that signal, fall back to
       # the rest. Without required:false, compose refuses to start this
@@ -97,8 +100,11 @@ services:
       # than CRS_VERSION — no more manual fetch-crs.sh step.
       - ./coraza-service/crs:/etc/coraza
       # Separate from crs/ on purpose — that dir gets wiped and refetched on
-      # every version change, this one persists. Edits here hot-reload, no
-      # restart needed.
+      # every version change, these persist. Edits here hot-reload, no
+      # restart needed. Read-only for coraza-service itself; crs-tuner
+      # mounts crs-exclusions read-write separately (it writes
+      # auto-<domain>.conf files here) — same host path, two containers.
+      - ./coraza-service/crs-extra:/etc/coraza-extra:ro
       - ./coraza-service/crs-exclusions:/etc/coraza-exclusions:ro
     expose:
       - "8003"
@@ -107,22 +113,122 @@ services:
     profiles: ["crowdsec"]
     image: crowdsecurity/crowdsec:latest
     environment:
-      - COLLECTIONS=crowdsecurity/nginx
+      # nginx: repeated-403/bad-behavior scenarios off the generic access log.
+      # modsecurity: crowdsecurity/modsecurity, fires immediately off a single
+      # CRITICAL-severity CRS match instead of waiting for a pattern — see
+      # scoring-service/app/crowdsec_client.py's log_modsec_matches_for_crowdsec.
+      - COLLECTIONS=crowdsecurity/nginx crowdsecurity/modsecurity
       # Local-only by design for this demo: no phoning home to CrowdSec's
       # cloud / community blocklist unless you opt in.
       - DISABLE_ONLINE_API=true
       - BOUNCER_KEY_scoring=${CROWDSEC_BOUNCER_KEY:-devbouncerkeychangeme}
     volumes:
-      # A bind mount to a pre-existing host file (see crowdsec/feed/access.log),
-      # not a named volume: CrowdSec's file datasource only globs for matches
-      # once at startup and never retries, so the file must already exist
+      # Bind mounts to pre-existing host files (see crowdsec/feed/), not a
+      # named volume: CrowdSec's file datasource only globs for matches once
+      # at startup and never retries, so both files must already exist
       # before the container starts — a named volume would still be empty at
-      # that point if scoring-service hadn't written to it yet.
+      # that point if scoring-service hadn't written to them yet.
       - ./crowdsec/feed:/var/log/crowdsec-feed:ro
       - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro
       - crowdsec-data:/var/lib/crowdsec/data
     expose:
       - "8080"
+
+  # Only needed for the local (default) model — not started at all if
+  # OLLAMA_URL in .env points at a remote/external Ollama instead. Separate
+  # profile from crs-tuner's own (ai-tuner) for exactly that reason: enabling
+  # the AI tuner doesn't have to mean running a local model.
+  ollama:
+    profiles: ["ollama-local"]
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-data:/root/.ollama
+    expose:
+      - "11434"
+    # Official image doesn't auto-pull a model — start the server, pull the
+    # configured one (idempotent: a no-op if already cached in the volume
+    # from a previous run), then wait on the server so it stays the
+    # container's foreground process.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        ollama serve &
+        sleep 2 &&
+        ollama pull ${AI_TUNER_MODEL:-llama3:8b} &&
+        wait
+
+  # Alternative to ollama/ollama-local above — an Ollama-API-compatible shim
+  # backed by `claude -p` (Claude Code's non-interactive mode) instead of a
+  # locally-run model, for using an existing Claude subscription's included
+  # usage instead of a GPU or metered API billing. Mutually exclusive with
+  # ollama-local in practice: point OLLAMA_URL at whichever one you're
+  # running, don't run both. Needs claude-shim/setup-credentials.sh run
+  # first (populates the claude-shim-creds volume — never a live mount of
+  # your real ~/.claude, see that script's own comments for why) and
+  # AI_TUNER_MODEL set to a real Claude model alias (e.g. "haiku", "sonnet"),
+  # not an Ollama tag. See claude-shim/README.md for real cost/latency
+  # numbers measured against this repo — it is NOT free, your account's
+  # usage is metered the same as interactive use, just not by a separate
+  # API key.
+  claude-shim:
+    profiles: ["claude-shim"]
+    build: ./claude-shim
+    environment:
+      - DEFAULT_MODEL=${AI_TUNER_MODEL:-haiku}
+    volumes:
+      # Isolated copy, not a live bind-mount of ~/.claude — see
+      # setup-credentials.sh. Read-write: claude -p needs to persist
+      # refreshed OAuth tokens as they rotate, but only ever to this
+      # isolated volume, never back to the host's real credentials.
+      - claude-shim-creds:/root/.claude
+    expose:
+      - "11434"
+
+  # Async, off the request path entirely: analyzes CRS matches (queued by
+  # scoring-service via a Redis Stream) with a local LLM, judging
+  # true/false-positive, and auto-generates a narrowly-scoped exclusion once
+  # the *same* (domain, rule, variable) is independently judged a false
+  # positive AI_TUNER_FP_THRESHOLD times — see crs-tuner/app/main.py.
+  crs-tuner:
+    profiles: ["ai-tuner"]
+    build: ./crs-tuner
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      # Local by default (the bundled ollama service above) — point this at
+      # a remote/external Ollama-compatible endpoint instead if you don't
+      # want to run a model in this stack at all. Doesn't imply anything
+      # about the ollama-local profile — that's a separate opt-in.
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
+      # Only used against a remote/hosted Ollama endpoint behind auth — see
+      # .env. Empty by default, no Authorization header sent.
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
+      - ENABLE_AI_TUNER=${ENABLE_AI_TUNER:-true}
+      - AI_TUNER_MODEL=${AI_TUNER_MODEL:-llama3:8b}
+      - AI_TUNER_FP_THRESHOLD=${AI_TUNER_FP_THRESHOLD:-3}
+      - AI_TUNER_CONFIDENCE_MIN=${AI_TUNER_CONFIDENCE_MIN:-0.7}
+      - EXCLUSIONS_DIR=/etc/coraza-exclusions
+    volumes:
+      # Read-write here — crs-tuner writes auto-<domain>.conf files into
+      # this same host path coraza-service mounts read-only.
+      - ./coraza-service/crs-exclusions:/etc/coraza-exclusions
+      # Bind mount, not a named volume: the audit trail (verdicts + the
+      # dedicated error log) is meant to be human-inspectable on the host,
+      # not hidden inside Docker's volume storage.
+      - ./crs-tuner/analysis:/var/lib/crs-tuner/analysis
+    depends_on:
+      redis:
+        condition: service_started
+      # required: false — ollama is a separate profile (ollama-local); if
+      # OLLAMA_URL points at a remote instance instead, that container never
+      # starts at all, and compose must not refuse to start crs-tuner over it.
+      ollama:
+        condition: service_started
+        required: false
+      # Same reasoning — a separate opt-in profile (claude-shim above),
+      # not started if OLLAMA_URL points somewhere else entirely.
+      claude-shim:
+        condition: service_started
+        required: false
 
   backend:
     image: mendhak/http-https-echo:31
@@ -150,8 +256,14 @@ services:
       - RISK_THRESHOLD=${RISK_THRESHOLD:-0.8}
       - AUDIT_MODE=${AUDIT_MODE:-false}
       - ENABLE_CORAZA=${ENABLE_CORAZA:-true}
-      - ENABLE_HEURISTIC=${ENABLE_HEURISTIC:-true}
       - ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-true}
+      - ENABLE_AI_TUNER=${ENABLE_AI_TUNER:-true}
+      # For the live ai-tuner/ollama connectivity check — same source as
+      # crs-tuner's own OLLAMA_URL/OLLAMA_API_KEY. The key is only ever used
+      # server-side for that check, never sent to the browser — only whether
+      # it's set at all is exposed (ollama_auth_configured).
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
       # App-level allowlist (belt-and-suspenders on top of DASHBOARD_BIND_ADDR
       # below) — matters once that bind is opened beyond loopback.
       - DASHBOARD_BIND_ADDR=${DASHBOARD_BIND_ADDR:-127.0.0.1}
@@ -179,8 +291,8 @@ services:
     image: grafana/k6:latest
     profiles: ["tools"]
     volumes:
-      - ./loadtest:/scripts:ro
-      - ./loadtest/results:/results
+      - ./tests/loadtest:/scripts:ro
+      - ./tests/loadtest/results:/results
       - ./coraza-service/crs:/crs:ro
     environment:
       - BASE_URL=http://envoy:${ENVOY_HTTP_PORT:-10000}
@@ -190,3 +302,11 @@ services:
 
 volumes:
   crowdsec-data:
+  ollama-data:
+  # Created by claude-shim/setup-credentials.sh, not by compose (external:
+  # true) — compose defaults to project-prefixing volume names (would
+  # otherwise be "envoy_claude-shim-creds"), which that script has no way
+  # to know in advance. Run setup-credentials.sh before starting the
+  # claude-shim profile, or this volume won't exist yet.
+  claude-shim-creds:
+    external: true

@@ -3,18 +3,18 @@
 # ssl=true domain in envoy-control-plane/routes/routes.csv, then scores the
 # results for TLS hardening / best practices via score.py — deliberately
 # ignoring the self-signed-certificate finding, since these are self-signed
-# dev certs by design (see generate-cert.sh), not a real hardening gap.
+# dev certs by design (see ../generate-cert.sh), not a real hardening gap.
 #
-# Usage: ./run-audit.sh [domain ...]
+# Usage: ./tests/run-audit.sh [domain ...]
 #   No args: audits every ssl=true row in routes.csv.
 #   With args: audits only the given domain(s) (must still be routable
 #   through envoy, e.g. present in routes.csv with ssl=true).
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROUTES_CSV="$ROOT/envoy-control-plane/routes/routes.csv"
-SSL_AUDIT_DIR="$ROOT/ssl-audit"
+SSL_AUDIT_DIR="$ROOT/tests/ssl-audit"
 REPORTS_DIR="$SSL_AUDIT_DIR/reports"
 mkdir -p "$REPORTS_DIR"
 

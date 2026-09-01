@@ -3,14 +3,14 @@
 # listener so you can watch the dashboard (http://localhost:8002) react live.
 #
 # "Malicious" traffic is split between two flavors: obviously bad User-Agents
-# (caught by scoring-service's own heuristic) and CRS-style attack payloads
-# (SQLi/XSS/LFI/RCE sent with a perfectly normal UA — these are the ones the
-# UA heuristic alone would miss, and are exactly what coraza-service exists
-# to catch).
+# (caught by CRS's own scanner-detection rules, e.g. 913100 — not always
+# enough anomaly score alone to cross RISK_THRESHOLD by itself, see TODO.md)
+# and CRS-style attack payloads (SQLi/XSS/LFI/RCE sent with a perfectly
+# normal UA — what coraza-service's actual rule matching exists to catch).
 #
-# Usage:
-#   ./generate-traffic.sh [count] [delay_seconds] [malicious_ratio_out_of_10]
-#   ./generate-traffic.sh 50 0.1 3
+# Usage (run from the project root):
+#   ./tests/generate-traffic.sh [count] [delay_seconds] [malicious_ratio_out_of_10]
+#   ./tests/generate-traffic.sh 50 0.1 3
 
 set -euo pipefail
 

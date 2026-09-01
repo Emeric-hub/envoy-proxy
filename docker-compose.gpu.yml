@@ -1,0 +1,21 @@
+# Optional override for GPU-accelerated local Ollama inference. Not merged
+# by default (a plain `docker compose up` ignores this file) — machines
+# without an NVIDIA GPU + the NVIDIA Container Toolkit installed would fail
+# to start the ollama service if this were unconditional.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+#     --profile coraza --profile crowdsec --profile ai-tuner --profile ollama-local \
+#     up -d
+#
+# Requires the NVIDIA Container Toolkit on the host:
+# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

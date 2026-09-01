@@ -8,20 +8,118 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **`claude-shim`: an Ollama-API-compatible alternative to `ollama-local`,
+  backed by `claude -p`** (Claude Code's non-interactive mode) instead of a
+  locally-run model — uses an existing Claude subscription's included usage
+  instead of a GPU or a metered `ANTHROPIC_API_KEY`. Drop-in for
+  `crs-tuner`: exposes `POST /api/chat` + `GET /api/tags` matching Ollama's
+  shapes, zero changes needed on `crs-tuner`'s side, just point `OLLAMA_URL`
+  at it. Credentials are never a live bind-mount of the host's real
+  `~/.claude` — `setup-credentials.sh` copies only the account/session-level
+  auth files into an isolated Docker volume the container reads/writes
+  instead, so nothing the container does can affect the actual local Claude
+  Code session. Every `Bash`/`Write`/`Edit`/`NotebookEdit` tool is denied on
+  every call — the "matched value" being judged is attacker-controlled
+  input, so a value crafted to look like a tool-use instruction can't
+  actually get anything executed. Verified end-to-end through the real
+  `crs-tuner` pipeline (`tests/crs-tuner-test.sh`), not just a standalone
+  curl test. Real cost/latency measured, not estimated, and it's not
+  free — see `claude-shim/README.md`; the single biggest factor found was
+  running `claude -p` from an empty working directory instead of a real
+  project directory (~$0.005-0.011/call steady-state vs. ~$0.11-0.12/call
+  with CLAUDE.md/project auto-discovery bloating every call's context).
+- **`crs-tuner`: async, LLM-tuned WAF exclusions.** Every CRS match at or
+  above `AI_TUNER_MIN_SEVERITY_CODE` is queued (Redis Stream `crs-matches`)
+  by `scoring-service` and analyzed off the request path by a self-hosted
+  LLM (Ollama; local by default, `OLLAMA_URL` can point at a remote
+  instance instead — separate `ollama-local`/`ai-tuner` Compose profiles so
+  enabling the tuner doesn't require running a local model). Every verdict
+  is logged (`crs-tuner/analysis/<domain>.jsonl`), with analysis failures
+  specifically kept in their own `_errors.jsonl`. Only once the *same*
+  (domain, path, rule, variable, key) is independently judged a false
+  positive `AI_TUNER_FP_THRESHOLD` times does `crs-tuner` generate and
+  hot-load a narrowly-scoped exclusion (`ctl:ruleRemoveTargetById`, chained
+  on Host *and* `REQUEST_FILENAME` — domain-, path-, and variable-scoped,
+  not domain-wide) into `coraza-service/crs-exclusions/auto-<domain>.conf`
+  — verified the full loop end-to-end, including GPU-accelerated inference
+  (0.15s warm vs. several seconds on CPU) and a live dashboard chart of
+  queue depth (`/api/queue`, shown only once something's actually queued).
+  Replaces two earlier real-time signals (a UA-pattern heuristic, then an
+  ML anomaly detector) that were both built and then removed — see
+  `TODO.md` for why.
+- **`AI_TUNER_INELIGIBLE_TAGS`: a hard, non-LLM eligibility gate on
+  `crs-tuner`.** Found empirically, not theoretically: under sustained
+  mixed attack traffic, the local model judged real CRS attack-signature
+  matches (SQLi, XSS, LFI, RCE, scanner detection) "false positive"
+  consistently enough to auto-generate dozens of exclusions across
+  multiple domains within minutes — raising the confidence bar or the
+  repeat threshold doesn't fix this, since the model was often confident
+  and consistent about being wrong. `scoring-service` now checks a match's
+  CRS tags before it's ever queued (`events.py`'s `publish_crs_match`) and
+  drops anything tagged as a real attack-signature category — no LLM
+  verdict can override this regardless of confidence or repetition. The
+  tuning loop is now structurally limited to the generic protocol/format
+  anomaly categories it was designed for. See `TODO.md`/`README.md` for
+  the full finding.
+- **`crs-tuner-test.sh`**: exercises the adaptive-exclusion loop end-to-end
+  against a real, non-attack false positive (an apostrophe in a name field
+  — CRS's classic `O'Brien`, trips rule 920273 at higher paranoia levels)
+  — repeats it, waits for `crs-tuner` to judge each one, reports the
+  verdicts and whether an exclusion got generated, and confirms unrelated
+  legitimate traffic is unaffected either way.
+- **`tests/options-impact-test.sh`**: sends one fixed request per traffic
+  category (legitimate, SQLi, XSS, LFI, RCE, scanner UA, a borderline false
+  positive) and reports the *active* configuration's actual effect —
+  composite score, contributing signals, real HTTP outcome, and the
+  underlying decision independent of `AUDIT_MODE` — so changing `.env`
+  options and re-running shows exactly what changed. Backed by a new
+  `dashboard` `/api/config` JSON endpoint (previously only embedded in the
+  HTML page as `window.__ACTIVE_CONFIG__`).
+- **Default `AI_TUNER_MODEL` switched from `llama3.2:3b` to `llama3:8b`** —
+  judges more reliably (see the `AI_TUNER_INELIGIBLE_TAGS` finding above,
+  found against the 3B model); wants GPU acceleration to stay fast, drop to
+  a smaller tag for CPU-only setups.
+- **Per-site hand-written exclusion files.** `coraza-service/crs-exclusions/`
+  already globs every `*.conf` in the directory, so a domain-scoped
+  hand-written exclusion no longer has to live mixed into the single shared
+  `crs_exclusion.conf` — it can go in its own `<domain>.conf` next to it
+  (see the new `shop.example.com.conf` for a worked example). Cross-domain
+  exclusions with no Host condition still belong in `crs_exclusion.conf`.
+  IDs stay unique across the whole directory, not just within one file —
+  coordinated by convention, same as before.
+- **`crs-extra/`**: a second hot-reloaded directory alongside
+  `crs-exclusions/`, for hand-authored new CRS-style rules rather than
+  narrowing/removing existing ones — same fsnotify mechanism, generalized
+  to watch both directories and glob-`Include` every `.conf` file in each
+  (`coraza-service`'s `buildWAF`/`watchConfDirs`). A three-way rule-ID
+  range convention (documented in both folders) keeps hand-written and
+  `crs-tuner`-generated rules from ever colliding.
+- **Direct Coraza/CRS → CrowdSec feedback loop**: a single CRITICAL-severity
+  CRS match now feeds CrowdSec's `crowdsecurity/modsecurity` scenario
+  immediately (originally `scoring-service/app/crowdsec_client.py`'s
+  `log_modsec_matches_for_crowdsec`, now `scoring-service-go/crowdsec/feed.go`'s
+  `LogModsecMatches` — see the Go rewrite entry below, writing ModSecurity-format error-log
+  lines Coraza itself doesn't natively produce), rather than only
+  indirectly via the generic repeated-403 pattern the access-log feed
+  already covered. One confirmed CRS match can now ban an IP outright,
+  even on a request whose own combined score doesn't cross
+  `RISK_THRESHOLD` locally — verified end-to-end: a single SQLi request
+  produced an immediate `crowdsecurity/modsecurity` ban, and the next
+  (otherwise harmless) request from that IP was correctly denied via the
+  `crowdsec` signal.
 - **Envoy edge proxy** with an `ext_authz` (HTTP-mode) filter delegating
   every request to `scoring-service` before routing.
-- **scoring-service**: combines a local UA/pattern heuristic, Coraza/CRS's
-  anomaly score, and CrowdSec's decision into one composite score
-  (`max()` of normalized signals), with per-source reasons surfaced to the
-  dashboard. Audit mode (`AUDIT_MODE=true`) scores and logs identically but
-  never actually blocks.
+- **scoring-service**: combines Coraza/CRS's anomaly score and CrowdSec's
+  decision into one composite score (`max()` of normalized signals), with
+  per-source reasons surfaced to the dashboard. Audit mode
+  (`AUDIT_MODE=true`) scores and logs identically but never actually blocks.
 - **coraza-service**: Coraza WAF + OWASP CRS in `SecRuleEngine
   DetectionOnly` mode — advisory only, never blocks on its own. Fetches CRS
   itself on startup (`CRS_VERSION`, supports `latest` via GitHub tags API),
-  hot-reloads a local exclusions file (`crs-exclusions/crs_exclusion.conf`)
-  via fsnotify with no restart, and now supports a configurable
-  `CRS_PARANOIA_LEVEL` (1–4) applied the same way, decoupled from CRS
-  fetching so it takes effect even without a version bump.
+  hot-reloads local exclusions (`crs-exclusions/`) and hand-authored new
+  rules (`crs-extra/`) via fsnotify with no restart, and supports a
+  configurable `CRS_PARANOIA_LEVEL` (1–4) applied the same way, decoupled
+  from CRS fetching so it takes effect even without a version bump.
 - **CrowdSec integration**: real log-based detection (not just IP
   reputation lookup) via the `crowdsecurity/nginx` collection, fed by an
   nginx-combined-format log scoring-service writes. Decisions are polled
@@ -68,7 +166,7 @@ compress a lot of iteration into each entry.
   while keeping every other real finding (cert lifetime, revocation,
   header presence, protocol/cipher support, known CVEs). Produces
   markdown and a styled HTML report.
-- **k6 load/smoke test** (`loadtest/smoke.js`) with a context banner and
+- **k6 load/smoke test** (`tests/loadtest/smoke.js`) with a context banner and
   saved results, runnable standalone via a Compose profile.
 - **Traffic generator** (`generate-traffic.sh`) — mixed normal/malicious
   synthetic traffic for exercising the dashboard and scoring pipeline.
@@ -96,6 +194,48 @@ compress a lot of iteration into each entry.
 
 ### Changed
 
+- **`scoring-service` rewritten from Python/FastAPI to Go
+  (`scoring-service-go/`), and Envoy's `ext_authz` filter switched from
+  HTTP mode to gRPC mode** (`envoy-control-plane/main.go`'s
+  `buildExtAuthzFilter` — `envoy.service.auth.v3.AuthorizationServer`
+  instead of a JSON-over-HTTP `POST /check`). Every behavior was ported
+  deliberately, not just translated: the composite scoring logic
+  (`scoring/`), the CrowdSec LAPI decision-stream mirror and its two
+  file-based log feeds including the exact ModSecurity grok-compatible
+  format (`crowdsec/`), the coraza-service client and its
+  `severity != "unknown"` filter (`coraza/`), and — critically —
+  `events.PublishCRSMatch`'s `AI_TUNER_INELIGIBLE_TAGS` hard gate that
+  keeps real attack-signature CRS matches out of `crs-tuner`'s queue no
+  matter what any LLM judges (`events/redis.go`). Fixed one latent bug
+  found while porting rather than carrying it forward: the original's
+  denied-response body indexed `reasons[0]` unchecked; the Go version
+  guards it. gRPC mode has no equivalent of HTTP mode's
+  `AllowedHeaders`/`AllowedUpstreamHeaders` (Envoy hands the whole request
+  to the authz server instead) — the same 6-header allow-list is now
+  enforced in the Go service itself (`authz/headers.go`), a deliberate
+  choice to not silently widen what scoring-service sees. Found one real
+  bug via live testing that the port itself didn't anticipate: filtering
+  headers to that old allow-list dropped a literal `host` header for
+  HTTP/1.1 requests entirely (only `:authority` was allow-listed,
+  HTTP/2-style), which meant CRS saw every request as missing its Host
+  header — including breaking every domain-scoped `crs-tuner` exclusion,
+  which key on `REQUEST_HEADERS:Host`. Fixed by synthesizing `host` from
+  `AttributeContext_HttpRequest`'s dedicated `Host` field (which Envoy
+  resolves correctly regardless of HTTP/1.1 vs. HTTP/2 vs. HTTP/3)
+  directly into the header map handed to coraza-service, rather than
+  relying on whichever header name the wire happened to use. Measured,
+  not assumed: ~10x lower average latency, ~15x lower p95, ~1.4x higher
+  throughput under identical k6 load — see `TODO.md`'s Performance
+  section for the full numbers.
+- **Moved everything traffic/verification-related into a new `tests/`
+  folder**: `loadtest/` → `tests/loadtest/`, `ssl-audit/` →
+  `tests/ssl-audit/`, `run-audit.sh` → `tests/run-audit.sh`,
+  `run-smoke-test.sh` → `tests/run-smoke-test.sh`, `crs-tuner-test.sh` →
+  `tests/crs-tuner-test.sh`, `generate-traffic.sh` →
+  `tests/generate-traffic.sh` — keeps the project root to the actual demo
+  stack plus pure bootstrap utilities (`generate-cert.sh`, `init.sh`). All
+  `tests/*.sh` scripts still run from the project root
+  (`./tests/<script>.sh`), not from inside `tests/`.
 - Bumped the Envoy image from v1.31.2 to v1.39.1.
 - Moved `envoy.yaml`, `error_pages/`, `default-site/`, and `ssl/` into a
   dedicated `envoy/` folder; moved `generate-cert.sh` and `run-audit.sh` to

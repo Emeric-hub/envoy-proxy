@@ -2,7 +2,7 @@
 """Turns one or more testssl.sh --jsonfile-pretty reports into a hardening
 score + readable findings list. The self-signed chain-of-trust finding is
 deliberately excluded from scoring — this demo's certs are self-signed by
-design (see ../generate-cert.sh), that's not a hardening gap to flag, unlike
+design (see ../../generate-cert.sh), that's not a hardening gap to flag, unlike
 everything else testssl.sh checks (protocol support, cipher strength,
 forward secrecy, known vulnerabilities, security headers, cert lifetime...).
 

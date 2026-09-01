@@ -16,9 +16,17 @@ envoy/ssl/*.key
 # Runtime log CrowdSec tails — the file must exist (see docker-compose.yml's
 # comment on the crowdsec service) but its content is transient.
 crowdsec/feed/access.log
+crowdsec/feed/modsecurity.log
 
 # Generated test/audit output.
-loadtest/results/*
-!loadtest/results/.gitkeep
-ssl-audit/reports/*
-!ssl-audit/reports/.gitkeep
+tests/loadtest/results/*
+!tests/loadtest/results/.gitkeep
+tests/ssl-audit/reports/*
+!tests/ssl-audit/reports/.gitkeep
+
+# crs-tuner's learned state — generated from observed traffic on this
+# deployment, not source config a human wrote (crs_exclusion.conf itself
+# stays tracked).
+coraza-service/crs-exclusions/auto-*.conf
+crs-tuner/analysis/*
+!crs-tuner/analysis/.gitkeep

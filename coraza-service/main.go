@@ -7,11 +7,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -42,7 +44,20 @@ type matchedRuleOut struct {
 	ID       int      `json:"id"`
 	Message  string   `json:"message"`
 	Severity string   `json:"severity"`
-	Tags     []string `json:"tags"`
+	// Coraza's own numeric severity code (0=Emergency..7=Debug, matching
+	// ModSecurity's convention) alongside the human string above — scoring-service
+	// needs this exact code, not the word, to feed CrowdSec's modsecurity
+	// scenario (crowdsecurity/modsecurity filters on severity 'CRITICAL' == 2).
+	SeverityCode int      `json:"severity_code"`
+	Tags         []string `json:"tags"`
+	// The actual matched variable/key/value (e.g. Variable=ARGS, Key="id",
+	// Value="1' OR '1'='1") — from the first MatchedData entry (the primary
+	// trigger for the common non-chained-rule case). Rule metadata alone
+	// isn't enough for anything downstream to judge whether a match was a
+	// real attack or a false positive; the actual payload is.
+	Variable string `json:"variable,omitempty"`
+	Key      string `json:"key,omitempty"`
+	Value    string `json:"value,omitempty"`
 }
 
 type checkResponse struct {
@@ -76,53 +91,72 @@ type wafHolder struct {
 
 var current atomic.Pointer[wafHolder]
 
-// buildWAF loads CRS itself, then — if present — the local exclusions file.
-// Exclusions must load after CRS's own rules: SecRuleRemoveById and friends
-// operate on already-registered rule IDs (see crs-exclusions/crs_exclusion.conf).
-// Missing exclusions file is not an error — it's optional.
-func buildWAF(crsDir, exclusionsPath string) (coraza.WAF, error) {
+// hasConfFiles checks via a real glob (not just assuming Coraza's Include
+// handles a zero-match glob gracefully) whether a directory has anything
+// worth including — an empty crs-extra/ or crs-exclusions/ on a fresh
+// checkout shouldn't turn into an Include-with-no-matches question mark.
+func hasConfFiles(dir string) bool {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.conf"))
+	return err == nil && len(matches) > 0
+}
+
+// buildWAF loads CRS itself, then — if present — hand-authored new rules
+// (extraDir) and local exclusions (exclusionsDir), in that order: both must
+// load after CRS's own rules (SecRuleRemoveById/ctl:ruleRemoveTargetById and
+// friends operate on already-registered rule IDs), and exclusions load last
+// so they can tune crs-extra's own rules too, not just CRS's. Both are
+// directories, globbed (Include's own glob support, not enumerated in Go —
+// same pattern main.conf already uses for CRS's REQUEST-*.conf), so dropping
+// in a new .conf file needs no code change on either side.
+func buildWAF(crsDir, extraDir, exclusionsDir string) (coraza.WAF, error) {
 	config := coraza.NewWAFConfig().
 		WithDirectives(baseDirectives).
 		WithDirectivesFromFile(crsDir + "/main.conf")
 
-	if _, err := os.Stat(exclusionsPath); err == nil {
-		config = config.WithDirectivesFromFile(exclusionsPath)
+	if hasConfFiles(extraDir) {
+		config = config.WithDirectives(fmt.Sprintf("Include %s/*.conf", extraDir))
 	} else {
-		log.Printf("no exclusions file at %s, skipping (%v)", exclusionsPath, err)
+		log.Printf("no *.conf files in %s, skipping", extraDir)
+	}
+	if hasConfFiles(exclusionsDir) {
+		config = config.WithDirectives(fmt.Sprintf("Include %s/*.conf", exclusionsDir))
+	} else {
+		log.Printf("no *.conf files in %s, skipping", exclusionsDir)
 	}
 
 	return coraza.NewWAF(config)
 }
 
 // reloadWAF rebuilds the WAF and swaps it in atomically. A failed reload (e.g.
-// a syntax error just introduced in the exclusions file) logs and keeps
+// a syntax error just introduced in an exclusion/extra rule) logs and keeps
 // serving the previous, still-valid instance rather than taking the service down.
-func reloadWAF(crsDir, exclusionsPath string) {
-	waf, err := buildWAF(crsDir, exclusionsPath)
+func reloadWAF(crsDir, extraDir, exclusionsDir string) {
+	waf, err := buildWAF(crsDir, extraDir, exclusionsDir)
 	if err != nil {
 		log.Printf("WAF reload failed, keeping previous instance: %v", err)
 		return
 	}
 	current.Store(&wafHolder{waf: waf})
-	log.Printf("WAF reloaded (exclusions: %s)", exclusionsPath)
+	log.Printf("WAF reloaded (extra: %s, exclusions: %s)", extraDir, exclusionsDir)
 }
 
-// watchExclusions hot-reloads the WAF whenever the exclusions file changes —
-// no restart needed. Watches the containing directory rather than the file
-// itself: editors commonly save via a temp-file-then-rename, which can leave
-// a direct file watch pointing at a now-detached inode.
-func watchExclusions(crsDir, exclusionsPath string) {
+// watchConfDirs hot-reloads the WAF whenever a .conf file in either
+// directory changes — no restart needed. Watches the directories themselves
+// (fsnotify isn't recursive, but neither directory has subdirectories),
+// which also correctly picks up new files (e.g. crs-tuner adding a fresh
+// crs-exclusions/auto-<domain>.conf), not just edits to existing ones.
+func watchConfDirs(crsDir, extraDir, exclusionsDir string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Printf("fsnotify unavailable, exclusions hot-reload disabled: %v", err)
+		log.Printf("fsnotify unavailable, hot-reload disabled: %v", err)
 		return
 	}
 	defer watcher.Close()
 
-	dir := filepath.Dir(exclusionsPath)
-	if err := watcher.Add(dir); err != nil {
-		log.Printf("failed to watch %s, exclusions hot-reload disabled: %v", dir, err)
-		return
+	for _, dir := range []string{extraDir, exclusionsDir} {
+		if err := watcher.Add(dir); err != nil {
+			log.Printf("failed to watch %s, hot-reload disabled for it: %v", dir, err)
+		}
 	}
 
 	var debounce *time.Timer
@@ -132,10 +166,10 @@ func watchExclusions(crsDir, exclusionsPath string) {
 			if !ok {
 				return
 			}
-			if filepath.Clean(event.Name) != filepath.Clean(exclusionsPath) {
+			if !strings.HasSuffix(event.Name, ".conf") {
 				continue
 			}
-			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
 				continue
 			}
 			// debounce: editors/docker bind-mount syncs often fire several
@@ -143,7 +177,7 @@ func watchExclusions(crsDir, exclusionsPath string) {
 			if debounce != nil {
 				debounce.Stop()
 			}
-			debounce = time.AfterFunc(300*time.Millisecond, func() { reloadWAF(crsDir, exclusionsPath) })
+			debounce = time.AfterFunc(300*time.Millisecond, func() { reloadWAF(crsDir, extraDir, exclusionsDir) })
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
@@ -202,12 +236,19 @@ func newHandler() http.HandlerFunc {
 		for _, mr := range tx.MatchedRules() {
 			rule := mr.Rule()
 			score += severityWeight(rule.Severity())
-			matched = append(matched, matchedRuleOut{
-				ID:       rule.ID(),
-				Message:  mr.Message(),
-				Severity: rule.Severity().String(),
-				Tags:     rule.Tags(),
-			})
+			out := matchedRuleOut{
+				ID:           rule.ID(),
+				Message:      mr.Message(),
+				Severity:     rule.Severity().String(),
+				SeverityCode: rule.Severity().Int(),
+				Tags:         rule.Tags(),
+			}
+			if datas := mr.MatchedDatas(); len(datas) > 0 {
+				out.Variable = datas[0].Variable().Name()
+				out.Key = datas[0].Key()
+				out.Value = datas[0].Value()
+			}
+			matched = append(matched, out)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -220,9 +261,13 @@ func main() {
 	if v := os.Getenv("CRS_DIR"); v != "" {
 		crsDir = v
 	}
-	exclusionsPath := "/etc/coraza-exclusions/crs_exclusion.conf"
-	if v := os.Getenv("EXCLUSIONS_FILE"); v != "" {
-		exclusionsPath = v
+	extraDir := "/etc/coraza-extra"
+	if v := os.Getenv("EXTRA_DIR"); v != "" {
+		extraDir = v
+	}
+	exclusionsDir := "/etc/coraza-exclusions"
+	if v := os.Getenv("EXCLUSIONS_DIR"); v != "" {
+		exclusionsDir = v
 	}
 	crsVersion := os.Getenv("CRS_VERSION")
 	if crsVersion == "" {
@@ -241,13 +286,13 @@ func main() {
 	// relative name; Coraza resolves those against the directory of whichever
 	// file WithDirectivesFromFile loaded, so that file (main.conf) and the .data
 	// files must live side by side — see fetchCRS in crs_fetch.go.
-	waf, err := buildWAF(crsDir, exclusionsPath)
+	waf, err := buildWAF(crsDir, extraDir, exclusionsDir)
 	if err != nil {
 		log.Fatalf("failed to initialize coraza WAF: %v", err)
 	}
 	current.Store(&wafHolder{waf: waf})
 
-	go watchExclusions(crsDir, exclusionsPath)
+	go watchConfDirs(crsDir, extraDir, exclusionsDir)
 
 	http.HandleFunc("/check", newHandler())
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -259,7 +304,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		reloadWAF(crsDir, exclusionsPath)
+		reloadWAF(crsDir, extraDir, exclusionsDir)
 		w.WriteHeader(http.StatusOK)
 	})
 

@@ -4,14 +4,14 @@
 # whatever's missing, runs the test, leaves the rest as it found it.
 #
 # Usage:
-#   ./run-smoke-test.sh                          # defaults: 20 VUs, 10s ramp, 20s hold
-#   ./run-smoke-test.sh 50 20s 40s                # heavier run
+#   ./tests/run-smoke-test.sh                    # defaults: 20 VUs, 10s ramp, 20s hold
+#   ./tests/run-smoke-test.sh 50 20s 40s          # heavier run
 #
-# Results land in loadtest/results/ (.txt and .json, timestamped) in addition
-# to the console summary.
+# Results land in tests/loadtest/results/ (.txt and .json, timestamped) in
+# addition to the console summary.
 
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 VUS="${1:-20}"
 RAMP_DURATION="${2:-10s}"

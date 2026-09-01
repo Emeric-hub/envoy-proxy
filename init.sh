@@ -6,9 +6,10 @@
 #      envoy-control-plane/routes/routes.csv, plus a "default" one backing
 #      the HTTPS listener's fallback filter chain (unmatched/no SNI) —
 #      skips any that already exist, see generate-cert.sh.
-#   4. Touches crowdsec/feed/access.log — CrowdSec's file datasource only
-#      globs for matches once at startup and never retries, so this must
-#      exist before `docker compose up` runs crowdsec for the first time.
+#   4. Touches crowdsec/feed/access.log and modsecurity.log — CrowdSec's file
+#      datasource only globs for matches once at startup and never retries,
+#      so both must exist before `docker compose up` runs crowdsec for the
+#      first time.
 #
 # Usage: ./init.sh
 
@@ -52,8 +53,8 @@ echo "Generating the fallback cert for unmatched HTTPS SNI..."
 "$ROOT/generate-cert.sh" default
 
 mkdir -p "$ROOT/crowdsec/feed"
-touch "$ROOT/crowdsec/feed/access.log"
+touch "$ROOT/crowdsec/feed/access.log" "$ROOT/crowdsec/feed/modsecurity.log"
 echo
-echo "crowdsec/feed/access.log ready"
+echo "crowdsec/feed/{access,modsecurity}.log ready"
 echo
 echo "Done. Next: docker compose up -d --build"

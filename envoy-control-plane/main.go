@@ -31,6 +31,7 @@ import (
 	streamaccesslogv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/stream/v3"
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	tlsinspectorv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -258,24 +259,25 @@ func exactMatcher(values ...string) *matcherv3.ListStringMatcher {
 // buildExtAuthzFilter mirrors the ext_authz http_service block that used to
 // be hand-written in envoy.yaml — same allowed headers, same fail-closed
 // behavior, same scoring-service target.
+// gRPC mode (scoring-service is now Go, speaking the ext_authz gRPC
+// protocol directly — see scoring-service-go/). Unlike HTTP mode, there's
+// no AllowedHeaders/AllowedUpstreamHeaders/PathPrefix here: gRPC mode hands
+// the *entire* request (all headers, method, path, body per
+// WithRequestBody below) to the authz server via CheckRequest, and the Go
+// service is responsible for its own header allow-listing and response
+// shaping (see scoring-service-go/authz) — deliberately replicating the
+// same 6-header allow-list this filter used to enforce, not silently
+// expanding what scoring-service sees.
 func buildExtAuthzFilter() *hcmv3.HttpFilter {
 	cfg := &extauthzv3.ExtAuthz{
 		TransportApiVersion: corev3.ApiVersion_V3,
 		FailureModeAllow:    false,
-		Services: &extauthzv3.ExtAuthz_HttpService{
-			HttpService: &extauthzv3.HttpService{
-				ServerUri: &corev3.HttpUri{
-					Uri:              "http://scoring-service:8001",
-					HttpUpstreamType: &corev3.HttpUri_Cluster{Cluster: "scoring_service"},
-					Timeout:          durationpb.New(extAuthzTimeout),
+		Services: &extauthzv3.ExtAuthz_GrpcService{
+			GrpcService: &corev3.GrpcService{
+				TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+					EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{ClusterName: "scoring_service"},
 				},
-				PathPrefix: "/check",
-				AuthorizationRequest: &extauthzv3.AuthorizationRequest{
-					AllowedHeaders: exactMatcher("user-agent", "x-forwarded-for", "x-envoy-external-address", ":authority", "content-type", "x-request-protocol"),
-				},
-				AuthorizationResponse: &extauthzv3.AuthorizationResponse{
-					AllowedUpstreamHeaders: exactMatcher("x-risk-score", "x-audit-would-block"),
-				},
+				Timeout: durationpb.New(extAuthzTimeout),
 			},
 		},
 		WithRequestBody: &extauthzv3.BufferSettings{
@@ -804,9 +806,24 @@ func (g *generator) rebuild(ctx context.Context) error {
 func (g *generator) apply(ctx context.Context, routes []route) error {
 	g.health.setRoutes(routes)
 
-	clusters := []cachetypes.Resource{
-		buildStaticCluster("scoring_service", "scoring-service", 8001),
+	// gRPC ext_authz requires HTTP/2 on this cluster — no TLS on this
+	// internal hop (same as before), so this is h2c (cleartext HTTP/2), set
+	// via TypedExtensionProtocolOptions on this cluster object specifically
+	// rather than inside buildStaticCluster itself, since that helper is
+	// also shared by buildRouteCluster for real TLS backends.
+	scoringCluster := buildStaticCluster("scoring_service", "scoring-service", 9001)
+	scoringCluster.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": mustAny(&upstreamshttpv3.HttpProtocolOptions{
+			UpstreamProtocolOptions: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+				ExplicitHttpConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig{
+					ProtocolConfig: &upstreamshttpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{
+						Http2ProtocolOptions: &corev3.Http2ProtocolOptions{},
+					},
+				},
+			},
+		}),
 	}
+	clusters := []cachetypes.Resource{scoringCluster}
 	for _, r := range routes {
 		clusters = append(clusters, buildRouteCluster(r))
 	}

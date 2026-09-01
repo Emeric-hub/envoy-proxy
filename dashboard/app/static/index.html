@@ -44,7 +44,6 @@
   td.reason { min-width: 260px; max-width: 360px; }
   td.reason .score-line { color: #60a5fa; font-weight: 600; margin-bottom: 0.15rem; }
   td.reason .reason-line { white-space: normal; }
-  td.reason .source-heuristic { color: #9aa0aa; }
   td.reason .source-crs { color: #fb923c; }
   td.reason .source-crowdsec { color: #a78bfa; }
   td.reason .no-signals { color: #4ade80; }
@@ -95,6 +94,9 @@
         </div>
       </div>
     </div>
+    <div class="charts-row" id="queue-row" style="display:none;">
+      <div class="chart-box" style="flex:1; height:160px;"><canvas id="chart-queue-depth"></canvas></div>
+    </div>
   </div>
 
   <div class="filters">
@@ -137,7 +139,7 @@ function escapeHtml(str) {
 function classifyReason(text) {
   if (text.startsWith('CRS ')) return 'source-crs';
   if (text.startsWith('CrowdSec ')) return 'source-crowdsec';
-  return 'source-heuristic';
+  return 'source-crs';
 }
 
 // Composite-score breakdown + one colored line per reason, split by tool —
@@ -147,7 +149,6 @@ function buildReasonCell(ev) {
   const cfg = window.__ACTIVE_CONFIG__ || {};
   const signals = ev.signals || {};
   const parts = [];
-  if (cfg.enable_heuristic) parts.push(`heuristic ${(signals.heuristic ?? 0).toFixed(2)}`);
   if (cfg.enable_coraza) parts.push(`CRS ${(signals.coraza ?? 0).toFixed(2)}`);
   if (cfg.enable_crowdsec) parts.push(`crowdsec ${(signals.crowdsec ?? 0).toFixed(2)}`);
   const scoreLine = `score ${ev.score.toFixed(2)}` + (parts.length ? ` = max(${parts.join(', ')})` : '');
@@ -455,9 +456,9 @@ function renderConfigBar() {
   document.getElementById('config-bar').innerHTML = `
     <span class="pill">audit mode: ${onOff(cfg.audit_mode)}</span>
     <span class="pill">risk threshold: <strong>${(cfg.risk_threshold ?? 0).toFixed(2)}</strong></span>
-    <span class="pill">heuristic: ${onOff(cfg.enable_heuristic)}</span>
     <span class="pill">coraza / CRS: ${onOff(cfg.enable_coraza)} <span id="coraza-live-dot" class="live-dot unknown" title="checking..."></span> <span style="color:#6b7280">(v${cfg.crs_version || '?'}, PL${cfg.crs_paranoia_level || '?'}, fetched ${(cfg.crs_fetched_at || 'unknown').split('T')[0]})</span></span>
     <span class="pill">crowdsec: ${onOff(cfg.enable_crowdsec)} <span id="crowdsec-live-dot" class="live-dot unknown" title="checking..."></span></span>
+    <span class="pill">ai-tuner / ollama: ${onOff(cfg.enable_ai_tuner)} <span id="ollama-live-dot" class="live-dot unknown" title="checking..."></span> ${cfg.ollama_auth_configured ? '<span style="color:#6b7280" title="Authorization header sent to Ollama (OLLAMA_API_KEY set)">🔒 auth</span>' : ''}</span>
   `;
 }
 renderConfigBar();
@@ -491,6 +492,14 @@ async function pollLiveStatus() {
     applyLiveDot('coraza-live-dot', null, '');
     document.getElementById('crowdsec-live-dot').title = 'dashboard could not reach its own /api/status';
     document.getElementById('coraza-live-dot').title = 'dashboard could not reach its own /api/status';
+  }
+  try {
+    const res = await fetch('/api/ollama-status');
+    const data = await res.json();
+    applyLiveDot('ollama-live-dot', data, 'ai-tuner disabled');
+  } catch (e) {
+    applyLiveDot('ollama-live-dot', null, '');
+    document.getElementById('ollama-live-dot').title = 'dashboard could not reach its own /api/ollama-status';
   }
 }
 pollLiveStatus();
@@ -574,6 +583,67 @@ async function pollBackends() {
 }
 pollBackends();
 setInterval(pollBackends, 5000);
+
+// crs-tuner's analysis queue — a live gauge sampled at a fixed interval,
+// not a bucketed event count, so this doesn't reuse the WINDOW_SECONDS/
+// bucket machinery the other trend charts use; a plain rolling
+// label-indexed line chart is simpler and correct for this shape of data.
+const QUEUE_HISTORY_MAX = 60; // 2 min at 2s polling
+let queueChart = null;
+
+function ensureQueueChart() {
+  if (queueChart) return queueChart;
+  const ctx = document.getElementById('chart-queue-depth').getContext('2d');
+  queueChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'queue length', data: [], borderColor: '#38bdf8', backgroundColor: '#38bdf8', tension: 0.15, pointRadius: 0, borderWidth: 2 },
+        { label: 'pending (in-flight)', data: [], borderColor: '#facc15', backgroundColor: '#facc15', tension: 0.15, pointRadius: 0, borderWidth: 2 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      scales: {
+        x: { ticks: { color: '#9aa0aa', maxTicksLimit: 6 }, grid: { color: '#262a33' } },
+        y: { min: 0, beginAtZero: true, ticks: { color: '#9aa0aa', precision: 0 }, grid: { color: '#262a33' } },
+      },
+      plugins: {
+        legend: { position: 'right', labels: { color: '#e6e6e6', boxWidth: 10, font: { size: 9 } } },
+        title: { display: true, text: 'AI tuner queue depth (last 2 min)', color: '#9aa0aa', font: { size: 11 } },
+      },
+    },
+  });
+  return queueChart;
+}
+
+// Row stays hidden until the first real reading — no point showing an
+// empty gauge when the ai-tuner profile isn't even running.
+async function pollQueueDepth() {
+  try {
+    const res = await fetch('/api/queue');
+    const data = await res.json();
+    if (!data.length && !data.pending) return; // still nothing queued/ever queued — stay hidden
+    document.getElementById('queue-row').style.display = '';
+    const chart = ensureQueueChart();
+    chart.data.labels.push(new Date().toLocaleTimeString());
+    chart.data.datasets[0].data.push(data.length ?? 0);
+    chart.data.datasets[1].data.push(data.pending ?? 0);
+    if (chart.data.labels.length > QUEUE_HISTORY_MAX) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+      chart.data.datasets[1].data.shift();
+    }
+    chart.update('none');
+  } catch (e) {
+    // transient — leave the chart as it was
+  }
+}
+pollQueueDepth();
+setInterval(pollQueueDepth, 2000);
 
 connect();
 tick();

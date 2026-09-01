@@ -15,8 +15,23 @@ logging.basicConfig(level=logging.INFO)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 CHANNEL = "risk-events"
+CRS_MATCH_STREAM = "crs-matches"
+CRS_TUNER_GROUP = "crs-tuner"
 SCORING_SERVICE_URL = os.environ.get("SCORING_SERVICE_URL", "http://scoring-service:8001")
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://envoy-control-plane:18001")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+# Server-side only — used to authenticate the live check below, never sent
+# to the browser. STATIC_CONFIG exposes only whether it's set (bool).
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
+
+_redis_client: redis.Redis | None = None
+
+
+def get_redis_client() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(REDIS_URL, socket_connect_timeout=0.5, socket_timeout=0.5)
+    return _redis_client
 
 
 def _bool_env(name: str, default: str) -> bool:
@@ -37,8 +52,9 @@ STATIC_CONFIG = {
     "risk_threshold": float(os.environ.get("RISK_THRESHOLD", "0.8")),
     "audit_mode": _bool_env("AUDIT_MODE", "false"),
     "enable_coraza": _bool_env("ENABLE_CORAZA", "true"),
-    "enable_heuristic": _bool_env("ENABLE_HEURISTIC", "true"),
     "enable_crowdsec": _bool_env("ENABLE_CROWDSEC", "true"),
+    "enable_ai_tuner": _bool_env("ENABLE_AI_TUNER", "true"),
+    "ollama_auth_configured": bool(OLLAMA_API_KEY),
 }
 
 
@@ -150,6 +166,14 @@ async def index() -> HTMLResponse:
     return HTMLResponse(html.replace("<!--ACTIVE_CONFIG-->", config_script))
 
 
+@app.get("/api/config")
+async def api_config() -> JSONResponse:
+    """Same data the HTML page embeds as window.__ACTIVE_CONFIG__, as plain
+    JSON — for tooling (tests/options-impact-test.sh) that wants the active
+    configuration without scraping the page."""
+    return JSONResponse(active_config())
+
+
 @app.get("/api/status")
 async def api_status() -> JSONResponse:
     """Proxies scoring-service's own live health check — the browser can't
@@ -182,6 +206,52 @@ async def api_backends() -> JSONResponse:
     except Exception:
         logger.warning("envoy-control-plane backend health check unreachable", exc_info=True)
         return JSONResponse({"backends": []})
+
+
+@app.get("/api/ollama-status")
+async def api_ollama_status() -> JSONResponse:
+    """Live reachability check against Ollama itself (GET /api/tags — cheap,
+    doesn't invoke the model), separate from ollama_auth_configured in
+    STATIC_CONFIG which only says whether a key is *set*, not whether it
+    actually works. Same fail-soft reasoning as /api/status and
+    /api/backends: an unreachable or misauthenticated endpoint is itself a
+    status worth showing, not a 500. Doesn't run at all if ai-tuner is
+    disabled — nothing to check."""
+    if not STATIC_CONFIG["enable_ai_tuner"]:
+        return JSONResponse({"enabled": False})
+    headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            response = await client.get(f"{OLLAMA_URL}/api/tags", headers=headers)
+            if response.status_code in (401, 403):
+                return JSONResponse({"enabled": True, "connected": False, "last_error": f"auth rejected (HTTP {response.status_code})"})
+            response.raise_for_status()
+            return JSONResponse({"enabled": True, "connected": True})
+    except Exception as exc:
+        logger.warning("ollama connectivity check failed", exc_info=True)
+        return JSONResponse({"enabled": True, "connected": False, "last_error": str(exc)})
+
+
+@app.get("/api/queue")
+async def api_queue() -> JSONResponse:
+    """crs-tuner's analysis queue depth. length is the raw Redis Stream
+    length; pending is how many entries crs-tuner's consumer group has
+    claimed but not yet acked (i.e. actually mid-analysis / stuck). Fails
+    soft: an empty/nonexistent stream or group (ai-tuner never enabled, or
+    nothing queued yet) is a legitimate "queue is empty" state, not an error."""
+    try:
+        client = get_redis_client()
+        length = await client.xlen(CRS_MATCH_STREAM)
+        pending = 0
+        try:
+            summary = await client.xpending(CRS_MATCH_STREAM, CRS_TUNER_GROUP)
+            pending = summary.get("pending", 0) if summary else 0
+        except Exception:
+            pending = 0  # consumer group doesn't exist yet — crs-tuner hasn't started
+        return JSONResponse({"length": length, "pending": pending})
+    except Exception:
+        logger.warning("queue depth check failed", exc_info=True)
+        return JSONResponse({"length": 0, "pending": 0})
 
 
 @app.websocket("/ws")
