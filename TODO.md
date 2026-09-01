@@ -21,6 +21,20 @@ for payloads CRS's regex rules don't catch. Either would plug in the same
 way Coraza and CrowdSec already do: a score in `[0, 1]`, folded into the
 same `max()` combine step, with its own reasons surfaced in the dashboard.
 
+## Configuration
+
+- **A `DASHBOARD_DOMAIN` (or similar) `.env` var** so the dashboard can be
+  reached through Envoy itself at a real domain, if one is provided —
+  currently it's only reachable directly via its own published port
+  (`DASHBOARD_PORT`/`DASHBOARD_BIND_ADDR`), with no `routes.csv` entry or
+  Envoy-side TLS of its own. If set, `envoy-control-plane` would need to
+  add a route for that domain (proxying to `dashboard:8002`) and, if
+  `ssl=true`-equivalent, a cert generated the same way `generate-cert.sh`
+  already does for any other domain — same mechanism as the fallback
+  `default` cert added for unmatched SNI. Optional/opt-in: unset by
+  default, so the direct-port path keeps working unchanged for anyone not
+  using it.
+
 ## Security follow-ups
 
 Roughly in order of how much it'd matter if this were ever run somewhere
@@ -94,6 +108,15 @@ more real than a laptop demo:
   handshake — the `curl` available in dev here isn't built with HTTP/3
   support. Worth testing from a real HTTP/3 client (recent Chrome, or a
   `curl` built against `ngtcp2`/`quiche`) before trusting it fully.
+- **`generate-traffic.sh` and `loadtest/smoke.js` share the same 5 fake
+  source IPs** (via spoofed `X-Forwarded-For`). Repeated runs across both
+  accumulate real CrowdSec bans against those IPs (`LePresidente/http-generic-403-bf`
+  — CrowdSec correctly reacting to a real pattern of repeated 403s), which
+  then makes *all* traffic from those IPs get blocked regardless of payload,
+  skewing later runs. Not a bug — CrowdSec is doing exactly what it's
+  supposed to — but if a smoke test run looks like 100% block rate for no
+  obvious reason, check `cscli decisions list` before assuming something's
+  broken. `cscli decisions delete --all` clears it for a fresh baseline.
 - **CrowdSec bouncer key rotation on an existing deployment.** CrowdSec
   only auto-registers a bouncer from its `BOUNCER_KEY_<name>` env var if
   that bouncer doesn't already exist — changing `CROWDSEC_BOUNCER_KEY` in

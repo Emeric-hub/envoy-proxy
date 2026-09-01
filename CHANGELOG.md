@@ -80,6 +80,19 @@ compress a lot of iteration into each entry.
   — run without either container entirely, not just with their scoring
   input disabled.
 - Branded 403/5xx error pages (HTML and JSON variants).
+- **Configurable request-handling limits** (continued): `.env`-driven ext_authz
+  timeout/body size, upstream connect timeout, overall request timeout, and
+  stream idle timeout (the last one matters for long-lived responses like SSE).
+- **HTTP → HTTPS redirect**, but only for `routes.csv` domains with `ssl=true`
+  — domains without a cert have no HTTPS listener to redirect to, so they
+  keep being served over plain HTTP directly.
+- **Per-request protocol tracking** (HTTP/1.1 / HTTP/2 / HTTP/3), resolved
+  by Envoy itself via the `%PROTOCOL%` command operator in a `header_mutation`
+  filter placed before `ext_authz`, forwarded through to scoring-service and
+  shown as its own column on the dashboard.
+- A default self-signed cert (`generate-cert.sh default`) backing the HTTPS
+  listener's `DefaultFilterChain` — see Fixed.
+- A favicon for the default site.
 
 ### Changed
 
@@ -91,6 +104,14 @@ compress a lot of iteration into each entry.
   (`DataSource_InlineBytes`) rather than referenced by filename — see Fixed.
 - `SSL_DIR`, dashboard bind address/port, and Envoy HTTP/HTTPS ports are
   all `.env`-configurable rather than hardcoded paths/values.
+- **Removed the `default-site` nginx container entirely.** Unmatched
+  domains are now answered directly by Envoy (`DirectResponseAction`,
+  `envoy/default-site/index.html` read fresh on every control-plane
+  rebuild) — no upstream, no separate container, no nginx-specific
+  version-leak surface to patch.
+- `Server` response header suppressed entirely (`PASS_THROUGH` +
+  `ResponseHeadersToRemove`) rather than left at Envoy's own generic
+  `server: envoy` default.
 
 ### Fixed
 
@@ -153,6 +174,20 @@ compress a lot of iteration into each entry.
 - **QUIC listener rejected** ("Non-HTTP/3 codec configured on QUIC
   listener") until the HTTP/3 listener's HCM was given an explicit
   `HTTP3` codec type — Envoy's default `AUTO` codec doesn't include it.
+- **nginx version leak on `default-site`'s unmatched paths**: a genuine
+  404 for a missing path passed straight through nginx's own default
+  error page, which embeds its version in the body regardless of the
+  `Server` header — moot now that `default-site` doesn't exist as a
+  container at all (see Changed), but was fixed in place first
+  (`server_tokens off` + routing 404s to the branded page) before the
+  container was removed entirely.
+- **Unmatched HTTPS SNI dropping the connection outright**
+  (`PR_END_OF_FILE_ERROR` client-side, no TLS alert, no HTTP response):
+  the HTTPS listener only had per-domain filter chains matched by SNI —
+  nothing to fall back to for a client with no SNI or an SNI matching no
+  `routes.csv` domain. Fixed with `Listener.DefaultFilterChain` backed by
+  a dedicated `default` cert, routing through the same catch-all
+  `RouteConfiguration` vhost the HTTP listener already had.
 
 ### Security
 

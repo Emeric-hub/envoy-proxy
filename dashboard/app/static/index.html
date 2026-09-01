@@ -112,7 +112,7 @@
 
   <div style="overflow-x:auto">
   <table>
-    <thead><tr><th>Time</th><th>Source IP</th><th>Domain</th><th>Method</th><th>Path</th><th>User-Agent</th><th>HTTP Status</th><th>Duration</th><th>Target</th><th>Decision</th><th>Reason</th></tr></thead>
+    <thead><tr><th>Time</th><th>Source IP</th><th>Domain</th><th>Method</th><th>Path</th><th>User-Agent</th><th>Protocol</th><th>HTTP Status</th><th>Duration</th><th>Target</th><th>Decision</th><th>Reason</th></tr></thead>
     <tbody id="rows"></tbody>
   </table>
   </div>
@@ -385,7 +385,7 @@ function renderTableAndStats() {
     // than let "deny" silently mean two different things.
     const wouldBlock = ev.decision === 'deny' && ev.audit_mode;
     const decisionText = wouldBlock ? 'deny <span class="audit-tag">(audit)</span>' : ev.decision;
-    tr.innerHTML = `<td>${time}</td><td class="ip">${ev.ip}</td><td>${ev.domain}</td><td>${ev.method}</td><td>${ev.path}</td><td>${ev.user_agent || '—'}</td><td>${ev.http_status}</td><td>${duration}</td><td>${targetForDomain(ev.domain)}</td><td class="decision">${decisionText}</td><td class="reason">${buildReasonCell(ev)}</td>`;
+    tr.innerHTML = `<td>${time}</td><td class="ip">${ev.ip}</td><td>${ev.domain}</td><td>${ev.method}</td><td>${ev.path}</td><td>${ev.user_agent || '—'}</td><td>${ev.protocol || '—'}</td><td>${ev.http_status}</td><td>${duration}</td><td>${targetForDomain(ev.domain)}</td><td class="decision">${decisionText}</td><td class="reason">${buildReasonCell(ev)}</td>`;
     rows.appendChild(tr);
   }
 }

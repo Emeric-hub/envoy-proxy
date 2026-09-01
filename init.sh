@@ -3,8 +3,9 @@
 #   1. Creates .env from .env.example if it doesn't exist yet.
 #   2. Replaces the placeholder CrowdSec bouncer key with a random one.
 #   3. Generates a self-signed cert/key for every ssl=true domain in
-#      envoy-control-plane/routes/routes.csv (skips domains that already
-#      have one — see generate-cert.sh).
+#      envoy-control-plane/routes/routes.csv, plus a "default" one backing
+#      the HTTPS listener's fallback filter chain (unmatched/no SNI) —
+#      skips any that already exist, see generate-cert.sh.
 #   4. Touches crowdsec/feed/access.log — CrowdSec's file datasource only
 #      globs for matches once at startup and never retries, so this must
 #      exist before `docker compose up` runs crowdsec for the first time.
@@ -45,6 +46,10 @@ while IFS=',' read -r id domain target port ssl cert_check scoring; do
     "$ROOT/generate-cert.sh" "$(echo "$domain" | tr -d '[:space:]')"
   fi
 done < "$ROUTES_CSV"
+
+echo
+echo "Generating the fallback cert for unmatched HTTPS SNI..."
+"$ROOT/generate-cert.sh" default
 
 mkdir -p "$ROOT/crowdsec/feed"
 touch "$ROOT/crowdsec/feed/access.log"

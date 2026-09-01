@@ -21,7 +21,6 @@ services:
       - envoy-control-plane
       - scoring-service
       - backend
-      - default-site
 
   envoy-control-plane:
     build: ./envoy-control-plane
@@ -30,6 +29,7 @@ services:
       - ENVOY_HTTPS_PORT=${ENVOY_HTTPS_PORT:-10443}
       - ROUTES_CSV=/etc/envoy-cp/routes/routes.csv
       - SSL_DIR=/etc/envoy-cp/ssl
+      - DEFAULT_SITE_DIR=/etc/envoy-cp/default-site
       - EXT_AUTHZ_MAX_BODY_BYTES=${EXT_AUTHZ_MAX_BODY_BYTES:-8192}
       - EXT_AUTHZ_TIMEOUT_MS=${EXT_AUTHZ_TIMEOUT_MS:-200}
       - UPSTREAM_CONNECT_TIMEOUT_MS=${UPSTREAM_CONNECT_TIMEOUT_MS:-1000}
@@ -43,23 +43,14 @@ services:
       # directory mount reflects live host directory contents instead.
       - ./envoy-control-plane/routes:/etc/envoy-cp/routes:ro
       - ./${SSL_DIR:-envoy/ssl}:/etc/envoy-cp/ssl:ro
+      # No separate default-site container: envoy-control-plane reads this
+      # directly and answers unmatched domains with a DirectResponseAction
+      # (see buildRouteConfig) — no upstream, no nginx, no version-leak
+      # surface to worry about.
+      - ./envoy/default-site:/etc/envoy-cp/default-site:ro
     expose:
       - "18000"
       - "18001"
-
-  default-site:
-    image: nginx:alpine
-    volumes:
-      - ./envoy/default-site:/usr/share/nginx/html:ro
-      # server_tokens off (hides nginx's version, in headers AND its own
-      # default error pages) + routes any unmatched path to the same
-      # branded page instead of nginx's raw 404 — see the file's own
-      # comment for why local_reply_config on Envoy's side can't fix this:
-      # it only rewrites Envoy-generated denials, not genuine upstream
-      # responses like a plain 404 for a missing path.
-      - ./envoy/default-site/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    expose:
-      - "80"
 
   scoring-service:
     build: ./scoring-service

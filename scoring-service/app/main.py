@@ -50,6 +50,7 @@ async def check(full_path: str, request: Request) -> Response:
 
     client_ip = extract_client_ip(headers)
     user_agent = headers.get("user-agent", "")
+    protocol = headers.get("x-request-protocol", "unknown")
 
     rule_score, rule_reason, rule_triggered = score_request(headers, request.method, path)
     anomaly_score, matched_rules = await get_anomaly_score(
@@ -84,6 +85,7 @@ async def check(full_path: str, request: Request) -> Response:
         method=request.method,
         path=path,
         user_agent=user_agent,
+        protocol=protocol,
         ip=client_ip,
         domain=headers.get("host", "unknown"),
         score=score,

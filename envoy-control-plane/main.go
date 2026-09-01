@@ -35,6 +35,8 @@ import (
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	quicv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/quic/v3"
+	headermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
+	mutationrulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -269,7 +271,7 @@ func buildExtAuthzFilter() *hcmv3.HttpFilter {
 				},
 				PathPrefix: "/check",
 				AuthorizationRequest: &extauthzv3.AuthorizationRequest{
-					AllowedHeaders: exactMatcher("user-agent", "x-forwarded-for", "x-envoy-external-address", ":authority", "content-type"),
+					AllowedHeaders: exactMatcher("user-agent", "x-forwarded-for", "x-envoy-external-address", ":authority", "content-type", "x-request-protocol"),
 				},
 				AuthorizationResponse: &extauthzv3.AuthorizationResponse{
 					AllowedUpstreamHeaders: exactMatcher("x-risk-score", "x-audit-would-block"),
@@ -283,6 +285,30 @@ func buildExtAuthzFilter() *hcmv3.HttpFilter {
 	}
 	return &hcmv3.HttpFilter{
 		Name:       "envoy.filters.http.ext_authz",
+		ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(cfg)},
+	}
+}
+
+// buildProtocolHeaderFilter must run before ext_authz in the filter chain
+// (it's listed first in HttpFilters — filters process the request in list
+// order): %PROTOCOL% is a command operator (same family used in access log
+// formats), evaluated at the point this filter runs, that resolves to the
+// actual downstream protocol — HTTP/1.1, HTTP/2, or HTTP/3. This is how
+// scoring-service (and from there, the dashboard) learns it; not something
+// a client can spoof, since RouteConfiguration-level header mutation runs
+// too late (after routing, i.e. after ext_authz has already made its call).
+func buildProtocolHeaderFilter() *hcmv3.HttpFilter {
+	cfg := &headermutationv3.HeaderMutation{
+		Mutations: &headermutationv3.Mutations{
+			RequestMutations: []*mutationrulesv3.HeaderMutation{{
+				Action: &mutationrulesv3.HeaderMutation_Append{
+					Append: headerOpt("x-request-protocol", "%PROTOCOL%"),
+				},
+			}},
+		},
+	}
+	return &hcmv3.HttpFilter{
+		Name:       "envoy.filters.http.header_mutation",
 		ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mustAny(cfg)},
 	}
 }
@@ -425,7 +451,7 @@ func buildHTTPConnectionManager(routeConfigName string) *hcmv3.HttpConnectionMan
 				},
 			},
 		},
-		HttpFilters: []*hcmv3.HttpFilter{buildExtAuthzFilter(), buildRouterFilter()},
+		HttpFilters: []*hcmv3.HttpFilter{buildProtocolHeaderFilter(), buildExtAuthzFilter(), buildRouterFilter()},
 	}
 }
 
@@ -446,67 +472,93 @@ func buildListenerHTTP(port uint32) *listenerv3.Listener {
 	}
 }
 
-// buildListenerHTTPS returns nil (no listener at all) if no route has
-// ssl=true and a usable cert — LDS removes the resource entirely rather than
-// publish a TLS listener with zero filter chains, which Envoy would reject.
+// loadDownstreamTLS reads a domain's cert/key from sslDir and embeds the
+// bytes inline (DataSource_InlineBytes) rather than referencing them by
+// filename: with a filename reference, replacing a cert's *content* in
+// place (same domain, renewed cert) produces a byte-identical Listener
+// proto — nothing for LDS to diff — so Envoy never re-reads the file and
+// keeps serving the stale cert indefinitely. Inlining the bytes means a
+// changed cert changes the proto itself, which is exactly what the existing
+// ssl/ fsnotify watcher (see generator.watch) is already triggering a
+// rebuild for.
+func loadDownstreamTLS(sslDir, domain string) (*tlsv3.DownstreamTlsContext, error) {
+	crtBytes, err := os.ReadFile(filepath.Join(sslDir, domain+".crt"))
+	if err != nil {
+		return nil, err
+	}
+	keyBytes, err := os.ReadFile(filepath.Join(sslDir, domain+".key"))
+	if err != nil {
+		return nil, err
+	}
+	return &tlsv3.DownstreamTlsContext{
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			// Explicit floor rather than relying on Envoy's own compiled-in
+			// default: TLS 1.0/1.1 are both formally deprecated (RFC 8996)
+			// and this pins the demo to 1.2+ regardless of what future
+			// Envoy versions default to.
+			TlsParams: &tlsv3.TlsParameters{
+				TlsMinimumProtocolVersion: tlsv3.TlsParameters_TLSv1_2,
+				TlsMaximumProtocolVersion: tlsv3.TlsParameters_TLSv1_3,
+			},
+			TlsCertificates: []*tlsv3.TlsCertificate{{
+				CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: crtBytes}},
+				PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: keyBytes}},
+			}},
+		},
+	}, nil
+}
+
+// buildListenerHTTPS returns nil (no listener at all) if there's no cert to
+// present at all — not even the fallback one — since a TLS listener with no
+// filter chain and no default one is meaningless and Envoy would reject it.
+//
+// The "default" domain (generate-cert.sh default) backs DefaultFilterChain:
+// without it, a client connecting with no SNI or an SNI that doesn't match
+// any routes.csv domain gets no filter chain match at all, and Envoy just
+// drops the connection — no TLS alert, no HTTP response, nothing. That's
+// what shows up client-side as a bare "connection reset" / PR_END_OF_FILE_ERROR
+// with zero indication a cert was ever the issue. The default chain routes
+// through the exact same RouteConfiguration (routeConfigNameHTTPS already
+// has a "*" catch-all vhost — see buildRouteConfig), so once the handshake
+// can complete at all, the existing default-site behavior takes over
+// identically to the HTTP listener.
 func buildListenerHTTPS(port uint32, routes []route, sslDir string) *listenerv3.Listener {
 	hcm := buildHTTPConnectionManager(routeConfigNameHTTPS)
-	var chains []*listenerv3.FilterChain
-	for _, r := range routes {
-		if !r.SSL {
-			continue
-		}
-		crt := filepath.Join(sslDir, r.Domain+".crt")
-		key := filepath.Join(sslDir, r.Domain+".key")
-		// Read and embed the actual bytes (DataSource_InlineBytes) rather than
-		// pass a DataSource_Filename path for Envoy to read itself: with a
-		// filename reference, replacing a cert's *content* in place (same
-		// domain, renewed cert) produces a byte-identical Listener proto —
-		// nothing for LDS to diff — so Envoy never re-reads the file and
-		// keeps serving the stale cert indefinitely. Inlining the bytes here
-		// means a changed cert changes the proto itself, which is exactly
-		// what the existing ssl/ fsnotify watcher (see generator.watch) is
-		// already triggering a rebuild for.
-		crtBytes, err := os.ReadFile(crt)
-		if err != nil {
-			log.Printf("route %s (%s): ssl=true but couldn't read cert at %s, skipping — run generate-cert.sh %s: %v", r.ID, r.Domain, crt, r.Domain, err)
-			continue
-		}
-		keyBytes, err := os.ReadFile(key)
-		if err != nil {
-			log.Printf("route %s (%s): ssl=true but couldn't read key at %s, skipping: %v", r.ID, r.Domain, key, err)
-			continue
-		}
-
-		downstreamTLS := &tlsv3.DownstreamTlsContext{
-			CommonTlsContext: &tlsv3.CommonTlsContext{
-				// Explicit floor rather than relying on Envoy's own compiled-in
-				// default: TLS 1.0/1.1 are both formally deprecated (RFC 8996)
-				// and this pins the demo to 1.2+ regardless of what future
-				// Envoy versions default to.
-				TlsParams: &tlsv3.TlsParameters{
-					TlsMinimumProtocolVersion: tlsv3.TlsParameters_TLSv1_2,
-					TlsMaximumProtocolVersion: tlsv3.TlsParameters_TLSv1_3,
-				},
-				TlsCertificates: []*tlsv3.TlsCertificate{{
-					CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: crtBytes}},
-					PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: keyBytes}},
-				}},
-			},
-		}
-		chains = append(chains, &listenerv3.FilterChain{
-			FilterChainMatch: &listenerv3.FilterChainMatch{ServerNames: []string{r.Domain}},
+	makeChain := func(match *listenerv3.FilterChainMatch, tls *tlsv3.DownstreamTlsContext) *listenerv3.FilterChain {
+		return &listenerv3.FilterChain{
+			FilterChainMatch: match,
 			TransportSocket: &corev3.TransportSocket{
 				Name:       "envoy.transport_sockets.tls",
-				ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(downstreamTLS)},
+				ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(tls)},
 			},
 			Filters: []*listenerv3.Filter{{
 				Name:       wellknown.HTTPConnectionManager,
 				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: mustAny(hcm)},
 			}},
-		})
+		}
 	}
-	if len(chains) == 0 {
+
+	var chains []*listenerv3.FilterChain
+	for _, r := range routes {
+		if !r.SSL {
+			continue
+		}
+		tls, err := loadDownstreamTLS(sslDir, r.Domain)
+		if err != nil {
+			log.Printf("route %s (%s): ssl=true but couldn't load cert, skipping — run generate-cert.sh %s: %v", r.ID, r.Domain, r.Domain, err)
+			continue
+		}
+		chains = append(chains, makeChain(&listenerv3.FilterChainMatch{ServerNames: []string{r.Domain}}, tls))
+	}
+
+	var defaultChain *listenerv3.FilterChain
+	if tls, err := loadDownstreamTLS(sslDir, "default"); err == nil {
+		defaultChain = makeChain(nil, tls)
+	} else {
+		log.Printf("no fallback cert for unmatched SNI — run generate-cert.sh default: %v", err)
+	}
+
+	if len(chains) == 0 && defaultChain == nil {
 		return nil
 	}
 	return &listenerv3.Listener{
@@ -519,7 +571,8 @@ func buildListenerHTTPS(port uint32, routes []route, sslDir string) *listenerv3.
 			Name:       "envoy.filters.listener.tls_inspector",
 			ConfigType: &listenerv3.ListenerFilter_TypedConfig{TypedConfig: mustAny(&tlsinspectorv3.TlsInspector{})},
 		}},
-		FilterChains: chains,
+		FilterChains:       chains,
+		DefaultFilterChain: defaultChain,
 	}
 }
 
@@ -534,43 +587,42 @@ func buildListenerHTTPS(port uint32, routes []route, sslDir string) *listenerv3.
 func buildListenerHTTPSQuic(port uint32, routes []route, sslDir string) *listenerv3.Listener {
 	hcm := buildHTTPConnectionManager(routeConfigNameHTTPS)
 	hcm.CodecType = hcmv3.HttpConnectionManager_HTTP3 // required on a QUIC listener — AUTO (the default) doesn't include HTTP/3 detection
-	var chains []*listenerv3.FilterChain
-	for _, r := range routes {
-		if !r.SSL {
-			continue
-		}
-		crtBytes, err := os.ReadFile(filepath.Join(sslDir, r.Domain+".crt"))
-		if err != nil {
-			continue // buildListenerHTTPS already logs the missing-cert case for this tick
-		}
-		keyBytes, err := os.ReadFile(filepath.Join(sslDir, r.Domain+".key"))
-		if err != nil {
-			continue
-		}
 
-		quicTransport := &quicv3.QuicDownstreamTransport{
-			DownstreamTlsContext: &tlsv3.DownstreamTlsContext{
-				CommonTlsContext: &tlsv3.CommonTlsContext{
-					TlsCertificates: []*tlsv3.TlsCertificate{{
-						CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: crtBytes}},
-						PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: keyBytes}},
-					}},
-				},
-			},
-		}
-		chains = append(chains, &listenerv3.FilterChain{
-			FilterChainMatch: &listenerv3.FilterChainMatch{ServerNames: []string{r.Domain}},
+	makeChain := func(match *listenerv3.FilterChainMatch, tls *tlsv3.DownstreamTlsContext) *listenerv3.FilterChain {
+		return &listenerv3.FilterChain{
+			FilterChainMatch: match,
 			TransportSocket: &corev3.TransportSocket{
 				Name:       "envoy.transport_sockets.quic",
-				ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(quicTransport)},
+				ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: mustAny(&quicv3.QuicDownstreamTransport{DownstreamTlsContext: tls})},
 			},
 			Filters: []*listenerv3.Filter{{
 				Name:       wellknown.HTTPConnectionManager,
 				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: mustAny(hcm)},
 			}},
-		})
+		}
 	}
-	if len(chains) == 0 {
+
+	var chains []*listenerv3.FilterChain
+	for _, r := range routes {
+		if !r.SSL {
+			continue
+		}
+		tls, err := loadDownstreamTLS(sslDir, r.Domain)
+		if err != nil {
+			continue // buildListenerHTTPS already logs the missing-cert case for this tick
+		}
+		chains = append(chains, makeChain(&listenerv3.FilterChainMatch{ServerNames: []string{r.Domain}}, tls))
+	}
+
+	// Same reasoning as buildListenerHTTPS's default chain: without it, a
+	// QUIC client with unmatched/no SNI gets no filter chain and the
+	// connection just never completes.
+	var defaultChain *listenerv3.FilterChain
+	if tls, err := loadDownstreamTLS(sslDir, "default"); err == nil {
+		defaultChain = makeChain(nil, tls)
+	}
+
+	if len(chains) == 0 && defaultChain == nil {
 		return nil
 	}
 	return &listenerv3.Listener{
@@ -582,7 +634,8 @@ func buildListenerHTTPSQuic(port uint32, routes []route, sslDir string) *listene
 		}}},
 		UdpListenerConfig: &listenerv3.UdpListenerConfig{QuicOptions: &listenerv3.QuicProtocolOptions{}},
 		EnableReusePort:   wrapperspb.Bool(true),
-		FilterChains:      chains,
+		FilterChains:       chains,
+		DefaultFilterChain: defaultChain,
 	}
 }
 
@@ -651,7 +704,7 @@ func buildRouteCluster(r route) *clusterv3.Cluster {
 // sending it over the plain HTTP listener wouldn't be dangerous (browsers
 // ignore Strict-Transport-Security on a non-HTTPS response per RFC 6797) but
 // there's no reason to send it there either.
-func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.HeaderValueOption) *routev3.RouteConfiguration {
+func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.HeaderValueOption, defaultSiteBody []byte, isHTTP bool, httpsPort uint32) *routev3.RouteConfiguration {
 	var vhosts []*routev3.VirtualHost
 	for _, r := range routes {
 		vh := &routev3.VirtualHost{
@@ -669,7 +722,21 @@ func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.Hea
 				}},
 			}},
 		}
-		if !r.Scoring {
+		// On the plain-HTTP route config only: a domain with ssl=true has a
+		// real HTTPS listener to send it to, so redirect rather than serve
+		// it in the clear. A domain with ssl=false has no HTTPS listener at
+		// all — redirecting it would send clients to a port that rejects
+		// them outright, so those keep being served over HTTP directly.
+		if isHTTP && r.SSL {
+			vh.Routes[0].Action = &routev3.Route_Redirect{Redirect: &routev3.RedirectAction{
+				SchemeRewriteSpecifier: &routev3.RedirectAction_HttpsRedirect{HttpsRedirect: true},
+				PortRedirect:           httpsPort,
+			}}
+		}
+		// Also skip scoring on the redirect itself — there's nothing to
+		// score, the request never reaches an upstream, it just bounces to
+		// HTTPS unconditionally.
+		if !r.Scoring || (isHTTP && r.SSL) {
 			vh.Routes[0].TypedPerFilterConfig = map[string]*anypb.Any{
 				"envoy.filters.http.ext_authz": mustAny(&extauthzv3.ExtAuthzPerRoute{
 					Override: &extauthzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
@@ -678,15 +745,23 @@ func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.Hea
 		}
 		vhosts = append(vhosts, vh)
 	}
+	// No upstream at all for unmatched domains — Envoy answers directly
+	// (DirectResponseAction) from the mounted envoy/default-site/index.html,
+	// read fresh on every rebuild (see apply()), not compiled into the
+	// binary. Content-type is set here (Route-level response_headers_to_add)
+	// rather than at the RouteConfiguration level, since that level's
+	// headers apply to every other route too, most of which proxy to
+	// backends with their own real content-types.
 	vhosts = append(vhosts, &routev3.VirtualHost{
 		Name:    "vh_default",
 		Domains: []string{"*"},
 		Routes: []*routev3.Route{{
-			Match:  &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
-			Action: &routev3.Route_Route{Route: &routev3.RouteAction{
-				ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "default_site"},
-				Timeout:          durationpb.New(requestTimeout),
+			Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
+			Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
+				Status: 200,
+				Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: defaultSiteBody}},
 			}},
+			ResponseHeadersToAdd: []*corev3.HeaderValueOption{headerOpt("content-type", "text/html; charset=utf-8")},
 		}},
 	})
 	return &routev3.RouteConfiguration{
@@ -698,14 +773,20 @@ func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.Hea
 }
 
 type generator struct {
-	csvPath   string
-	sslDir    string
-	httpPort  uint32
-	httpsPort uint32
-	cache     cachev3.SnapshotCache
-	version   int64
-	health    *healthChecker
+	csvPath       string
+	sslDir        string
+	defaultSiteDir string
+	httpPort      uint32
+	httpsPort     uint32
+	cache         cachev3.SnapshotCache
+	version       int64
+	health        *healthChecker
 }
+
+// defaultSiteFallback is used only if envoy/default-site/index.html can't be
+// read (e.g. a fresh checkout before the mount is populated, or a bad mount)
+// — better than failing every unmatched-domain request outright.
+const defaultSiteFallback = `<!doctype html><html><body style="font-family:system-ui;background:#0f1115;color:#e6e6e6;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><p>No site configured for this domain.</p></body></html>`
 
 func (g *generator) rebuild(ctx context.Context) error {
 	routes, err := loadRoutes(g.csvPath)
@@ -725,10 +806,15 @@ func (g *generator) apply(ctx context.Context, routes []route) error {
 
 	clusters := []cachetypes.Resource{
 		buildStaticCluster("scoring_service", "scoring-service", 8001),
-		buildStaticCluster("default_site", "default-site", 80),
 	}
 	for _, r := range routes {
 		clusters = append(clusters, buildRouteCluster(r))
+	}
+
+	defaultSiteBody, err := os.ReadFile(filepath.Join(g.defaultSiteDir, "index.html"))
+	if err != nil {
+		log.Printf("reading default-site index.html: %v — serving a minimal fallback instead", err)
+		defaultSiteBody = []byte(defaultSiteFallback)
 	}
 
 	listeners := []cachetypes.Resource{buildListenerHTTP(g.httpPort)}
@@ -746,8 +832,8 @@ func (g *generator) apply(ctx context.Context, routes []route) error {
 		// implies a QUIC listener exists alongside it.
 		headerOpt("alt-svc", fmt.Sprintf(`h3=":%d"; ma=86400`, g.httpsPort)))
 	routeConfigs := []cachetypes.Resource{
-		buildRouteConfig(routes, routeConfigNameHTTP, baseSecurityHeaders()),
-		buildRouteConfig(routes, routeConfigNameHTTPS, httpsHeaders),
+		buildRouteConfig(routes, routeConfigNameHTTP, baseSecurityHeaders(), defaultSiteBody, true, g.httpsPort),
+		buildRouteConfig(routes, routeConfigNameHTTPS, httpsHeaders, defaultSiteBody, false, g.httpsPort),
 	}
 
 	version := atomic.AddInt64(&g.version, 1)
@@ -775,6 +861,7 @@ func (g *generator) apply(ctx context.Context, routes []route) error {
 func main() {
 	csvPath := envOr("ROUTES_CSV", "/etc/envoy-cp/routes.csv")
 	sslDir := envOr("SSL_DIR", "/etc/envoy-cp/ssl")
+	defaultSiteDir := envOr("DEFAULT_SITE_DIR", "/etc/envoy-cp/default-site")
 	httpPort := envOrInt("ENVOY_HTTP_PORT", 10000)
 	httpsPort := envOrInt("ENVOY_HTTPS_PORT", 10443)
 	listenAddr := envOr("LISTEN_ADDR", ":18000")
@@ -789,12 +876,13 @@ func main() {
 	snapshotCache := cachev3.NewSnapshotCache(true, cachev3.IDHash{}, nil)
 
 	g := &generator{
-		csvPath:   csvPath,
-		sslDir:    sslDir,
-		httpPort:  uint32(httpPort),
-		httpsPort: uint32(httpsPort),
-		cache:     snapshotCache,
-		health:    newHealthChecker(),
+		csvPath:        csvPath,
+		sslDir:         sslDir,
+		defaultSiteDir: defaultSiteDir,
+		httpPort:       uint32(httpPort),
+		httpsPort:      uint32(httpsPort),
+		cache:          snapshotCache,
+		health:         newHealthChecker(),
 	}
 
 	ctx := context.Background()
@@ -857,6 +945,9 @@ func (g *generator) watch(ctx context.Context) {
 		if err := watcher.Add(g.sslDir); err != nil {
 			log.Printf("failed to watch %s: %v", g.sslDir, err)
 		}
+	}
+	if err := watcher.Add(g.defaultSiteDir); err != nil {
+		log.Printf("failed to watch %s: %v", g.defaultSiteDir, err)
 	}
 
 	var debounce *time.Timer
