@@ -65,16 +65,18 @@ var (
 	upstreamConnTimeout  time.Duration // TCP connect timeout to any upstream (scoring-service, default-site, routes.csv targets)
 	requestTimeout       time.Duration // overall per-request timeout (RouteAction) — Envoy's own default is 15s if unset
 	streamIdleTimeout    time.Duration // how long a stream may go fully silent before Envoy resets it — matters for long-lived SSE responses
+	acmeHttp01Port       uint32        // fixed port for Let's Encrypt's HTTP-01 challenge — always 80 in real use, that's the ACME protocol's requirement, not configurable on their end
 )
 
 type route struct {
-	ID        string
-	Domain    string
-	Target    string
-	Port      int
-	SSL       bool
-	CertCheck bool
-	Scoring   bool
+	ID          string
+	Domain      string
+	Target      string
+	Port        int
+	SSL         bool
+	CertCheck   bool
+	Scoring     bool
+	LetsEncrypt bool
 }
 
 func parseBool(s string) bool {
@@ -102,8 +104,8 @@ func loadRoutes(path string) ([]route, error) {
 
 	var routes []route
 	for i, rec := range records[1:] { // skip header
-		if len(rec) < 7 {
-			log.Printf("routes.csv line %d: expected 7 columns, got %d, skipping", i+2, len(rec))
+		if len(rec) < 8 {
+			log.Printf("routes.csv line %d: expected 8 columns, got %d, skipping", i+2, len(rec))
 			continue
 		}
 		port, err := strconv.Atoi(strings.TrimSpace(rec[3]))
@@ -112,13 +114,14 @@ func loadRoutes(path string) ([]route, error) {
 			continue
 		}
 		routes = append(routes, route{
-			ID:        strings.TrimSpace(rec[0]),
-			Domain:    strings.TrimSpace(rec[1]),
-			Target:    strings.TrimSpace(rec[2]),
-			Port:      port,
-			SSL:       parseBool(rec[4]),
-			CertCheck: parseBool(rec[5]),
-			Scoring:   parseBool(rec[6]),
+			ID:          strings.TrimSpace(rec[0]),
+			Domain:      strings.TrimSpace(rec[1]),
+			Target:      strings.TrimSpace(rec[2]),
+			Port:        port,
+			SSL:         parseBool(rec[4]),
+			CertCheck:   parseBool(rec[5]),
+			Scoring:     parseBool(rec[6]),
+			LetsEncrypt: parseBool(rec[7]),
 		})
 	}
 	return routes, nil
@@ -153,10 +156,54 @@ type healthChecker struct {
 	mu      sync.RWMutex
 	routes  []route
 	results map[string]targetHealth // keyed by "target:port"
+	sslDir  string                  // for reading letsencrypt-sidecar's .expiry/.acme-status/.acme-error files
 }
 
-func newHealthChecker() *healthChecker {
-	return &healthChecker{results: make(map[string]targetHealth)}
+func newHealthChecker(sslDir string) *healthChecker {
+	return &healthChecker{results: make(map[string]targetHealth), sslDir: sslDir}
+}
+
+// letsEncryptStatus mirrors what letsencrypt-sidecar writes next to a
+// domain's cert (see that service's certstore package) — read fresh per
+// request, same tolerant-of-missing-file treatment as coraza-service's
+// VERSION/FETCHED_AT sidecar metadata files elsewhere in this repo.
+type letsEncryptStatus struct {
+	Enabled   bool   `json:"enabled"`
+	Status    string `json:"status"` // "ok" | "failed" | "pending" (no files written yet)
+	ExpiresAt string `json:"expires_at,omitempty"`
+	LastError string `json:"last_error,omitempty"`
+}
+
+func readFileTrim(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func (h *healthChecker) letsEncryptSnapshot() map[string]letsEncryptStatus {
+	h.mu.RLock()
+	routes := append([]route(nil), h.routes...)
+	h.mu.RUnlock()
+
+	out := map[string]letsEncryptStatus{}
+	for _, r := range routes {
+		if !r.LetsEncrypt {
+			continue
+		}
+		status := readFileTrim(filepath.Join(h.sslDir, r.Domain+".acme-status"))
+		if status == "" {
+			status = "pending"
+		}
+		out[r.Domain] = letsEncryptStatus{
+			Enabled:   true,
+			Status:    status,
+			ExpiresAt: readFileTrim(filepath.Join(h.sslDir, r.Domain+".expiry")),
+			LastError: readFileTrim(filepath.Join(h.sslDir, r.Domain+".acme-error")),
+		}
+	}
+	return out
 }
 
 // setRoutes is called every time routes.csv reloads, so newly added routes
@@ -237,7 +284,10 @@ func (h *healthChecker) snapshot() []backendStatus {
 
 func (h *healthChecker) handler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"backends": h.snapshot()})
+	json.NewEncoder(w).Encode(map[string]any{
+		"backends":    h.snapshot(),
+		"letsencrypt": h.letsEncryptSnapshot(),
+	})
 }
 
 func mustAny(msg proto.Message) *anypb.Any {
@@ -461,6 +511,57 @@ func buildListenerHTTP(port uint32) *listenerv3.Listener {
 	hcm := buildHTTPConnectionManager(routeConfigNameHTTP)
 	return &listenerv3.Listener{
 		Name: "listener_http",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
+			Address:       "0.0.0.0",
+			PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
+		}}},
+		FilterChains: []*listenerv3.FilterChain{{
+			Filters: []*listenerv3.Filter{{
+				Name:       wellknown.HTTPConnectionManager,
+				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: mustAny(hcm)},
+			}},
+		}},
+	}
+}
+
+// buildAcmeChallengeListener serves ONLY Let's Encrypt's HTTP-01 challenge
+// path, proxied straight to letsencrypt-sidecar's own tiny HTTP server.
+// Deliberately minimal — no ext_authz, no per-domain routing, no
+// routes.csv dependency at all in the route itself (a static inline
+// RouteConfig, not RDS): this must work identically no matter which
+// domain the client's Host header claims, since Let's Encrypt's validator
+// doesn't send this demo's usual traffic shape. Built and added to the
+// xDS snapshot only when at least one route has LetsEncrypt: true (see
+// apply()) — otherwise this listener doesn't exist, so users not using
+// the feature see no behavior change and don't need port 80 published.
+func buildAcmeChallengeListener(port uint32) *listenerv3.Listener {
+	routeConfig := &routev3.RouteConfiguration{
+		Name: "acme_challenge_routes",
+		VirtualHosts: []*routev3.VirtualHost{{
+			Name:    "vh_acme_challenge",
+			Domains: []string{"*"},
+			Routes: []*routev3.Route{{
+				Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
+				Action: &routev3.Route_Route{Route: &routev3.RouteAction{
+					ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "acme_challenge"},
+					Timeout:          durationpb.New(requestTimeout),
+				}},
+			}},
+		}},
+	}
+	hcm := &hcmv3.HttpConnectionManager{
+		StatPrefix:                 "ingress_acme_challenge",
+		UseRemoteAddress:           wrapperspb.Bool(true),
+		ServerHeaderTransformation: hcmv3.HttpConnectionManager_PASS_THROUGH,
+		AccessLog: []*accesslogv3.AccessLog{{
+			Name:       "envoy.access_loggers.stdout",
+			ConfigType: &accesslogv3.AccessLog_TypedConfig{TypedConfig: mustAny(&streamaccesslogv3.StdoutAccessLog{})},
+		}},
+		RouteSpecifier: &hcmv3.HttpConnectionManager_RouteConfig{RouteConfig: routeConfig},
+		HttpFilters:    []*hcmv3.HttpFilter{buildRouterFilter()},
+	}
+	return &listenerv3.Listener{
+		Name: "listener_acme_challenge",
 		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
 			Address:       "0.0.0.0",
 			PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: port},
@@ -828,6 +929,20 @@ func (g *generator) apply(ctx context.Context, routes []route) error {
 		clusters = append(clusters, buildRouteCluster(r))
 	}
 
+	// Only present at all when at least one route actually wants an
+	// auto-managed certificate — users not using the feature get no
+	// behavior change and don't need port 80 published.
+	needsAcme := false
+	for _, r := range routes {
+		if r.LetsEncrypt {
+			needsAcme = true
+			break
+		}
+	}
+	if needsAcme {
+		clusters = append(clusters, buildStaticCluster("acme_challenge", "letsencrypt-sidecar", 8090))
+	}
+
 	defaultSiteBody, err := os.ReadFile(filepath.Join(g.defaultSiteDir, "index.html"))
 	if err != nil {
 		log.Printf("reading default-site index.html: %v — serving a minimal fallback instead", err)
@@ -840,6 +955,9 @@ func (g *generator) apply(ctx context.Context, routes []route) error {
 	}
 	if quicListener := buildListenerHTTPSQuic(g.httpsPort, routes, g.sslDir); quicListener != nil {
 		listeners = append(listeners, quicListener)
+	}
+	if needsAcme {
+		listeners = append(listeners, buildAcmeChallengeListener(acmeHttp01Port))
 	}
 
 	httpsHeaders := append(append([]*corev3.HeaderValueOption{}, baseSecurityHeaders()...),
@@ -889,6 +1007,7 @@ func main() {
 	upstreamConnTimeout = time.Duration(envOrInt("UPSTREAM_CONNECT_TIMEOUT_MS", 1000)) * time.Millisecond
 	requestTimeout = time.Duration(envOrInt("REQUEST_TIMEOUT_S", 15)) * time.Second
 	streamIdleTimeout = time.Duration(envOrInt("STREAM_IDLE_TIMEOUT_S", 300)) * time.Second
+	acmeHttp01Port = uint32(envOrInt("ACME_HTTP01_PORT", 80))
 
 	snapshotCache := cachev3.NewSnapshotCache(true, cachev3.IDHash{}, nil)
 
@@ -899,7 +1018,7 @@ func main() {
 		httpPort:       uint32(httpPort),
 		httpsPort:      uint32(httpsPort),
 		cache:          snapshotCache,
-		health:         newHealthChecker(),
+		health:         newHealthChecker(sslDir),
 	}
 
 	ctx := context.Background()

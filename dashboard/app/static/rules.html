@@ -1,0 +1,69 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AI-tuner generated exclusions</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 1.5rem 2rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 0.25rem; }
+  .sub { color: #9aa0aa; font-size: 0.85rem; margin: 0 0 1.25rem; }
+  a { color: #9aa0aa; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #2a2f3a; vertical-align: top; }
+  th { color: #9aa0aa; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  td.mono { font-family: ui-monospace, monospace; font-size: 0.8rem; }
+  td.reasoning { color: #c7cbd1; max-width: 32rem; }
+  .confidence { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; }
+  .empty { color: #9aa0aa; padding: 2rem 0; text-align: center; }
+  .count { color: #4ade80; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>AI-tuner generated exclusions <span id="count"></span></h1>
+  <p class="sub">Every WAF exclusion rule <code>crs-tuner</code> auto-generated, most recent first — see <a href="/">← dashboard</a>. Each row corresponds to a line in <code>coraza-service/crs-exclusions/auto-&lt;domain&gt;.conf</code> (rule ID 60000+).</p>
+  <div id="content"></div>
+
+<script>
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function confidenceColor(c) {
+  if (c >= 0.9) return '#4ade80';
+  if (c >= 0.75) return '#facc15';
+  return '#f87171';
+}
+async function load() {
+  const res = await fetch('/api/generated-exclusions');
+  const data = await res.json();
+  document.getElementById('count').innerHTML = data.count
+    ? `— <span class="count">${data.count}</span> total`
+    : '';
+  const content = document.getElementById('content');
+  if (!data.exclusions.length) {
+    content.innerHTML = '<div class="empty">No exclusions generated yet.</div>';
+    return;
+  }
+  const rows = data.exclusions.map(e => `
+    <tr>
+      <td class="mono">${escapeHtml((e.ts || '').replace('T', ' ').slice(0, 19))}</td>
+      <td class="mono">${escapeHtml(e.auto_id)}</td>
+      <td>${escapeHtml(e.domain)}</td>
+      <td class="mono">${escapeHtml(e.path || '(domain-wide)')}</td>
+      <td class="mono">${escapeHtml(e.rule_id)}</td>
+      <td class="mono">${escapeHtml(e.variable)}${e.key ? ':' + escapeHtml(e.key) : ''}</td>
+      <td><span class="confidence" style="background:${confidenceColor(e.confidence)}22;color:${confidenceColor(e.confidence)}">${(e.confidence ?? 0).toFixed(2)}</span></td>
+      <td class="reasoning">${escapeHtml(e.reasoning)}</td>
+    </tr>`).join('');
+  content.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>When</th><th>ID</th><th>Domain</th><th>Path</th><th>Rule</th><th>Target</th><th>Confidence</th><th>Reasoning (last verdict)</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>

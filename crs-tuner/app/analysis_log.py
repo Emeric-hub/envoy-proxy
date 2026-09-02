@@ -46,6 +46,34 @@ async def write_verdict(*, domain: str, fields: dict, verdict: dict) -> None:
         logger.warning("failed to write analysis log", exc_info=True)
 
 
+async def write_generated_exclusion(
+    *, auto_id: int, domain: str, path: str, rule_id: str, variable: str, key: str, confidence: float, reasoning: str, count: int
+) -> None:
+    """One line per auto-generated exclusion rule — separate from
+    write_verdict's per-match audit trail (every match judged, most of
+    which never cross the threshold): this is specifically "a new rule
+    got written," the answer to "what custom rules exist and why" the
+    dashboard's rules page surfaces. auto_id is the rule's own id (60000+,
+    see exclusion_writer._next_auto_id) so this record and the actual
+    generated SecRule line can be cross-referenced directly."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "auto_id": auto_id,
+        "domain": domain,
+        "path": path,
+        "rule_id": rule_id,
+        "variable": variable,
+        "key": key,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "fp_count": count,
+    }
+    try:
+        _append(os.path.join(ANALYSIS_DIR, "_generated-exclusions.jsonl"), record)
+    except Exception:
+        logger.warning("failed to write generated-exclusions log", exc_info=True)
+
+
 async def write_error(*, stage: str, fields: dict, error: str) -> None:
     """Failures get their own dedicated log (_errors.jsonl), separate from
     verdicts — "how often is analysis itself failing" is a different

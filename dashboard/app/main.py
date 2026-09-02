@@ -166,6 +166,39 @@ async def index() -> HTMLResponse:
     return HTMLResponse(html.replace("<!--ACTIVE_CONFIG-->", config_script))
 
 
+@app.get("/rules", response_class=HTMLResponse)
+async def rules_page() -> HTMLResponse:
+    with open("app/static/rules.html") as f:
+        return HTMLResponse(f.read())
+
+
+@app.get("/api/generated-exclusions")
+async def api_generated_exclusions() -> JSONResponse:
+    """Every auto-generated crs-tuner exclusion, most recent first — the
+    "what custom rules exist and why" audit view. Reads
+    _generated-exclusions.jsonl (crs-tuner/app/analysis_log.py's
+    write_generated_exclusion, one line per rule actually written, not
+    per verdict judged) fresh per request, same tolerant-of-missing-file
+    treatment as every other sidecar-metadata read in this app — an empty
+    list is the correct answer before ai-tuner has ever generated
+    anything, not an error."""
+    path = "/analysis/_generated-exclusions.jsonl"
+    exclusions = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        exclusions.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        pass
+    exclusions.reverse()  # most recent first
+    return JSONResponse({"exclusions": exclusions, "count": len(exclusions)})
+
+
 @app.get("/api/config")
 async def api_config() -> JSONResponse:
     """Same data the HTML page embeds as window.__ACTIVE_CONFIG__, as plain

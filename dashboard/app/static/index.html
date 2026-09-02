@@ -62,7 +62,7 @@
 <!--ACTIVE_CONFIG-->
 </head>
 <body>
-  <h1>Risk classification — live <span id="status">connecting…</span></h1>
+  <h1>Risk classification — live <span id="status">connecting…</span> <a href="/rules" style="font-size:0.6em; color:#9aa0aa; margin-left:0.75rem;">AI-tuner rules →</a></h1>
 
   <div class="config-bar" id="config-bar"></div>
 
@@ -96,6 +96,7 @@
     </div>
     <div class="charts-row" id="queue-row" style="display:none;">
       <div class="chart-box" style="flex:1; height:160px;"><canvas id="chart-queue-depth"></canvas></div>
+      <div class="chart-box" style="flex:1; height:160px;"><canvas id="chart-generated-exclusions"></canvas></div>
     </div>
   </div>
 
@@ -514,7 +515,8 @@ function truncate(str, n) {
 // — several routes.csv rows commonly share one backend). The whole thing is
 // drawn in a fixed logical coordinate space and left to SVG's own viewBox
 // scaling to fit the box, so it never overflows regardless of route count.
-function renderTopology(backends) {
+function renderTopology(backends, letsencrypt) {
+  letsencrypt = letsencrypt || {};
   const svg = document.getElementById('topology-svg');
   const empty = document.getElementById('topology-empty');
   if (!backends || backends.length === 0) {
@@ -553,6 +555,17 @@ function renderTopology(backends) {
     const y = domainY.get(d);
     parts.push(`<rect x="${leftX}" y="${y}" width="${leftChipW}" height="${chipH}" rx="8" fill="#0f1115" stroke="#2a2f3a" />`);
     parts.push(`<text x="${leftX + leftChipW / 2}" y="${y + chipH / 2 + 3}" font-size="9" fill="#e6e6e6" text-anchor="middle">${escapeHtml(truncate(d, 20))}</text>`);
+    const le = letsencrypt[d];
+    if (le && le.enabled) {
+      const leColor = le.status === 'ok' ? '#4ade80' : le.status === 'failed' ? '#f87171' : '#4b5563';
+      const leTitle = le.status === 'ok'
+        ? `Let's Encrypt: ok — expires ${le.expires_at || 'unknown'}`
+        : le.status === 'failed'
+          ? `Let's Encrypt: failed — ${le.last_error || 'unknown error'}`
+          : "Let's Encrypt: pending (no certificate issued yet)";
+      parts.push(`<circle cx="${leftX + leftChipW - 6}" cy="${y - 2}" r="4.5" fill="${leColor}"><title>${escapeHtml(leTitle)}</title></circle>`);
+      parts.push(`<text x="${leftX + leftChipW - 6}" y="${y - 1}" font-size="6" fill="#0f1115" text-anchor="middle" pointer-events="none">L</text>`);
+    }
   }
   for (const b of backends) {
     const key = `${b.target}:${b.port}`;
@@ -576,7 +589,7 @@ async function pollBackends() {
     const backends = data.backends || [];
     domainToTarget = new Map();
     for (const b of backends) for (const d of (b.domains || [])) domainToTarget.set(d, `${b.target}:${b.port}`);
-    renderTopology(backends);
+    renderTopology(backends, data.letsencrypt);
   } catch (e) {
     renderTopology([]);
   }
@@ -644,6 +657,63 @@ async function pollQueueDepth() {
 }
 pollQueueDepth();
 setInterval(pollQueueDepth, 2000);
+
+// Same rolling-sampled-gauge pattern as the queue-depth chart above, just
+// for /api/generated-exclusions' running total instead — a monotonically
+// increasing count, so this reads as "when did new rules get generated,"
+// not a bucketed rate. Full detail (why each one was generated) lives on
+// /rules, linked from the chart title.
+const EXCLUSIONS_HISTORY_MAX = 60;
+let exclusionsChart = null;
+
+function ensureExclusionsChart() {
+  if (exclusionsChart) return exclusionsChart;
+  const ctx = document.getElementById('chart-generated-exclusions').getContext('2d');
+  exclusionsChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'exclusions generated', data: [], borderColor: '#c084fc', backgroundColor: '#c084fc', tension: 0.15, pointRadius: 0, borderWidth: 2, stepped: true },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      scales: {
+        x: { ticks: { color: '#9aa0aa', maxTicksLimit: 6 }, grid: { color: '#262a33' } },
+        y: { min: 0, beginAtZero: true, ticks: { color: '#9aa0aa', precision: 0 }, grid: { color: '#262a33' } },
+      },
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: 'AI-tuner rules generated — see /rules', color: '#9aa0aa', font: { size: 11 } },
+      },
+    },
+  });
+  return exclusionsChart;
+}
+
+async function pollGeneratedExclusionsCount() {
+  try {
+    const res = await fetch('/api/generated-exclusions');
+    const data = await res.json();
+    if (!data.count) return; // nothing generated yet — stay hidden, same as the queue chart
+    document.getElementById('queue-row').style.display = '';
+    const chart = ensureExclusionsChart();
+    chart.data.labels.push(new Date().toLocaleTimeString());
+    chart.data.datasets[0].data.push(data.count);
+    if (chart.data.labels.length > EXCLUSIONS_HISTORY_MAX) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+    }
+    chart.update('none');
+  } catch (e) {
+    // transient — leave the chart as it was
+  }
+}
+pollGeneratedExclusionsCount();
+setInterval(pollGeneratedExclusionsCount, 10000);
 
 connect();
 tick();

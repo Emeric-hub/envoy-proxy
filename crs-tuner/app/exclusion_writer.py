@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 
 import redis.asyncio as redis
 
+from app.analysis_log import write_generated_exclusion
+
 logger = logging.getLogger("crs-tuner.exclusions")
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -98,3 +100,7 @@ async def _write_exclusion(*, domain: str, path: str, rule_id: str, variable: st
     with open(filename, "a") as f:
         f.write(header + rule)
     logger.info("wrote auto-exclusion id=%d domain=%s path=%s rule=%s target=%s", new_id, domain, path, rule_id, target)
+    await write_generated_exclusion(
+        auto_id=new_id, domain=domain, path=path, rule_id=rule_id, variable=variable, key=key,
+        confidence=verdict.get("confidence", 0.0), reasoning=verdict.get("reasoning", ""), count=count,
+    )

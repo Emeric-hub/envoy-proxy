@@ -8,6 +8,54 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **`letsencrypt-sidecar`: opt-in automatic TLS via Let's Encrypt.** A new
+  `routes.csv` column (`letsencrypt`) flags a domain for real
+  issuance/renewal instead of `generate-cert.sh`'s self-signed flow —
+  written into the exact same `envoy/ssl/<domain>.crt`/`.key` naming
+  convention, so `envoy-control-plane`'s existing fsnotify hot-reload picks
+  it up with zero changes on that side. HTTP-01 challenges are served by a
+  dedicated Envoy listener (`buildAcmeChallengeListener`, port 80, built
+  only when at least one route actually needs it) proxying to the
+  sidecar's own tiny HTTP server. Real ACME account key persists in a new
+  `letsencrypt-data` volume (never bind-mounted); private keys are written
+  `0600` (real credential material, unlike the self-signed flow's
+  throwaway `0644`). Verified against Let's Encrypt's real staging
+  API — account registration succeeded, and issuance for `shop.example.com`
+  correctly failed with `rejectedIdentifier: forbidden by policy`,
+  confirming the entire plumbing chain works up to the one boundary that
+  can't be crossed in this repo (a real, owned, publicly-resolvable
+  domain). `/routes/health` gained a `letsencrypt` key (status + expiry +
+  last error per domain); the dashboard shows it as a small badge per
+  front domain in the topology view.
+- **A dashboard page and chart for `crs-tuner`'s auto-generated
+  exclusions.** Every rule `crs-tuner` writes now also logs a structured
+  record (`crs-tuner/analysis/_generated-exclusions.jsonl`, mirroring the
+  existing dedicated-log convention `_errors.jsonl` already established)
+  with the rule's own auto-assigned ID, domain, path, CRS rule, target
+  variable, confidence, and reasoning — cross-referenceable by ID with the
+  actual generated `SecRule` line. A new **`/rules`** dashboard page lists
+  every one, most recent first; the main dashboard gained a live chart of
+  the running total (same rolling-sampled-gauge pattern as the existing
+  queue-depth chart), appearing only once something's actually been
+  generated.
+- **`crs-tuner`'s prompt now judges the matched value on its own content,
+  not just which rule category matched it.** Found and fixed a real gap:
+  a generic protocol-enforcement rule (e.g. 920273, "invalid character")
+  can still be tripped by a genuine attack payload, and the model would
+  sometimes reason "it's just a protocol rule" without checking whether
+  the actual matched *value* was a textbook attack string. The system
+  prompt (`crs-tuner/app/ollama_client.py`, shared by both the Ollama and
+  `claude-shim` backends since they take the same request shape) now
+  explicitly lists recognizable attack patterns (SQL tautologies, script
+  injection, path traversal, command injection, encoded variants) to
+  classify true-positive regardless of rule category, alongside what a
+  genuine false positive looks like, so it doesn't overcorrect into
+  flagging everything. Verified live: the same textbook `' OR '1'='1`
+  payload on rule 920273 now judges `true_positive` (confidence 1.0)
+  consistently across repeated identical requests, while a genuinely
+  benign match on a *different* variable of the same request (a numeric
+  parameter counter) still correctly judges `false_positive` — the fix is
+  value-content-aware, not a blanket change in either direction.
 - **`claude-shim`: an Ollama-API-compatible alternative to `ollama-local`,
   backed by `claude -p`** (Claude Code's non-interactive mode) instead of a
   locally-run model — uses an existing Claude subscription's included usage

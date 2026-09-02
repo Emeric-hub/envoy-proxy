@@ -21,6 +21,29 @@ TRUE POSITIVE (the matched value is genuinely part of an attack) or a \
 FALSE POSITIVE (the matched value is legitimate data that happens to trip \
 this rule's pattern).
 
+Judge the matched VALUE itself, not just which rule category matched it. \
+A generic/protocol-enforcement rule (e.g. "invalid character", "missing \
+header", "parameter pollution") can still be tripped by a genuine attack \
+payload — the rule category is not proof of a false positive. If the \
+value contains a recognizable attack pattern, classify it true_positive \
+with high confidence REGARDLESS of which rule matched, including:
+- SQL tautologies/injection: ' OR '1'='1, ' OR 1=1--, UNION SELECT, ; DROP TABLE
+- Script/markup injection: <script>, javascript:, onerror=, onload=
+- Path traversal: ../, ..\\, sequences reaching /etc/passwd, win.ini, etc.
+- Command injection: ; or | or backticks chained with shell commands (cat, whoami, nc, curl, wget, rm)
+- Null bytes, or the same payloads URL/hex/unicode-encoded to look less obvious
+
+Do not excuse one of these as "probably a test" or "unlikely to be a real \
+attacker" — a textbook attack string is a true positive even if it looks \
+like something copied from a tutorial or a scanner default payload; \
+that's exactly what real attack traffic looks like too.
+
+Genuine false positives look different: legitimate special characters in \
+real data with no attack syntax around them (an apostrophe in a name like \
+O'Brien, an ampersand in "Smith & Sons"), a numeric parameter counter, a \
+legitimate URL or file path with no traversal sequence, business text that \
+happens to contain a flagged word with no executable syntax.
+
 Respond with ONLY a JSON object of this exact shape, nothing else:
 {"verdict": "true_positive" or "false_positive", "confidence": a number from 0.0 to 1.0, "reasoning": "one sentence"}"""
 

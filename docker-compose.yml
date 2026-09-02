@@ -17,6 +17,16 @@ services:
       # Admin API (9901) is intentionally NOT published — envoy.yaml binds it
       # to 127.0.0.1 inside the container (no auth on that API), so reach it
       # with `docker compose exec envoy` rather than opening it to the host.
+      #
+      # Port 80 for Let's Encrypt's HTTP-01 challenge — not the ACME
+      # protocol's port, it's fixed, not configurable on their end.
+      # Commented out by default: envoy-control-plane only builds the
+      # ACME-challenge listener at all once a routes.csv row has
+      # letsencrypt=true (see that repo's buildAcmeChallengeListener), so
+      # this is a no-op otherwise. Uncomment when using the "letsencrypt"
+      # profile — see claude-shim-style opt-in note on the
+      # letsencrypt-sidecar service below.
+      # - "${ACME_HTTP01_PORT:-80}:${ACME_HTTP01_PORT:-80}"
     depends_on:
       - envoy-control-plane
       - scoring-service
@@ -35,6 +45,7 @@ services:
       - UPSTREAM_CONNECT_TIMEOUT_MS=${UPSTREAM_CONNECT_TIMEOUT_MS:-1000}
       - REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-15}
       - STREAM_IDLE_TIMEOUT_S=${STREAM_IDLE_TIMEOUT_S:-300}
+      - ACME_HTTP01_PORT=${ACME_HTTP01_PORT:-80}
     volumes:
       # Directory mounts, not single-file mounts: a single-file bind mount is
       # bound to that file's inode, and an edit that replaces the file (write
@@ -42,6 +53,9 @@ services:
       # some file-write tools) leaves the mount pointing at nothing. A
       # directory mount reflects live host directory contents instead.
       - ./envoy-control-plane/routes:/etc/envoy-cp/routes:ro
+      # Read-write from letsencrypt-sidecar's side (a separate mount of
+      # this same host path, see that service below) — this side stays
+      # read-only, envoy-control-plane only ever reads certs, never writes.
       - ./${SSL_DIR:-envoy/ssl}:/etc/envoy-cp/ssl:ro
       # No separate default-site container: envoy-control-plane reads this
       # directly and answers unmatched domains with a DirectResponseAction
@@ -51,6 +65,45 @@ services:
     expose:
       - "18000"
       - "18001"
+    depends_on:
+      # required: false — letsencrypt-sidecar is a separate opt-in profile
+      # (see that service below); envoy-control-plane must still start
+      # fine without it for everyone not using the feature.
+      letsencrypt-sidecar:
+        condition: service_started
+        required: false
+
+  # Opt-in: issues/renews real Let's Encrypt certificates for any
+  # routes.csv row with letsencrypt=true, dropping them into the same
+  # envoy/ssl/ directory envoy-control-plane already hot-reloads from —
+  # see letsencrypt-sidecar/README (real issuance needs a real, owned,
+  # publicly-resolvable domain with port 80 reachable from the internet;
+  # this repo's own *.example.com domains can never actually succeed).
+  letsencrypt-sidecar:
+    profiles: ["letsencrypt"]
+    build: ./letsencrypt-sidecar
+    environment:
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
+      # Staging by default — production Let's Encrypt has real, low rate
+      # limits; staging is the safe default the same way AUDIT_MODE
+      # defaults safe elsewhere in this repo.
+      - LETSENCRYPT_STAGING=${LETSENCRYPT_STAGING:-true}
+      - SSL_DIR=/etc/envoy-cp/ssl
+      - ROUTES_CSV=/etc/envoy-cp/routes/routes.csv
+      - ACCOUNT_DIR=/lego
+      - CHALLENGE_ADDR=:8090
+      - ACME_RENEW_DAYS_BEFORE=${ACME_RENEW_DAYS_BEFORE:-30}
+      - ACME_CHECK_INTERVAL_H=${ACME_CHECK_INTERVAL_H:-12}
+    volumes:
+      - ./envoy-control-plane/routes:/etc/envoy-cp/routes:ro
+      # Read-write — this is the side that actually issues/renews and
+      # writes cert+key+expiry+status files.
+      - ./${SSL_DIR:-envoy/ssl}:/etc/envoy-cp/ssl
+      # Persistent ACME account key — never bind-mounted into the repo,
+      # same treatment as crowdsec-data/ollama-data/claude-shim-creds.
+      - letsencrypt-data:/lego
+    expose:
+      - "8090"
 
   scoring-service:
     build: ./scoring-service-go
@@ -277,6 +330,11 @@ services:
       # directory mount tolerates missing files fine (read code already
       # handles that gracefully).
       - ./coraza-service/crs:/crs:ro
+      # Read-only — for the generated-exclusions rules page/chart
+      # (_generated-exclusions.jsonl, written by crs-tuner's
+      # exclusion_writer.py). Same directory crs-tuner itself writes to,
+      # mounted separately here so the dashboard never needs write access.
+      - ./crs-tuner/analysis:/analysis:ro
     ports:
       # Bound to 127.0.0.1 by default — the dashboard has no auth of its own,
       # so it shouldn't be reachable off-host unless explicitly opened via
@@ -303,6 +361,7 @@ services:
 volumes:
   crowdsec-data:
   ollama-data:
+  letsencrypt-data:
   # Created by claude-shim/setup-credentials.sh, not by compose (external:
   # true) — compose defaults to project-prefixing volume names (would
   # otherwise be "envoy_claude-shim-creds"), which that script has no way

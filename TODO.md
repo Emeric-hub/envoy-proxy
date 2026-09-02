@@ -188,6 +188,15 @@ more real than a laptop demo:
 
 ## Known limitations / not fully verified
 
+- **`letsencrypt-sidecar` only supports HTTP-01**, not DNS-01 — no
+  wildcard certs, and it needs port 80 reachable from the real internet.
+  DNS-01 would remove that requirement but needs DNS provider API
+  credentials per domain, a meaningfully bigger secrets story than this
+  demo takes on today. Also genuinely unverifiable end-to-end in this
+  repo regardless: `*.example.com` is IANA-reserved and not publicly
+  resolvable, so real issuance can never succeed here by design — see
+  `letsencrypt-sidecar/README.md` for what *was* verified (the whole
+  chain up to that boundary, against Let's Encrypt's real staging API).
 - **HTTP/3 (QUIC)** is wired up (UDP listener bound, `alt-svc` advertised,
   Envoy accepts the config) but hasn't been exercised with a real QUIC
   handshake — the `curl` available in dev here isn't built with HTTP/3
