@@ -853,6 +853,11 @@ func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.Hea
 				}),
 			}
 		}
+		// Prepended, not appended: routes are matched in order and these
+		// are exact-path matches against the catch-all "/" prefix route
+		// above, so they need to come first to ever be reached at all.
+		// nil (feature off) is a no-op prepend.
+		vh.Routes = append(buildSecurityTxtRoutes(r.Domain), vh.Routes...)
 		vhosts = append(vhosts, vh)
 	}
 	// vh_default catches every Host that doesn't match a configured domain.

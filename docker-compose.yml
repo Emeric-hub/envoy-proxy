@@ -46,6 +46,16 @@ services:
       - REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-15}
       - STREAM_IDLE_TIMEOUT_S=${STREAM_IDLE_TIMEOUT_S:-300}
       - ACME_HTTP01_PORT=${ACME_HTTP01_PORT:-80}
+      # Off entirely unless SECURITY_TXT_CONTACT is set — see
+      # security_txt.go's doc comment. Empty defaults for everything else
+      # here match "field just isn't included," not an error.
+      - SECURITY_TXT_CONTACT=${SECURITY_TXT_CONTACT:-}
+      - SECURITY_TXT_EXPIRES_DAYS=${SECURITY_TXT_EXPIRES_DAYS:-365}
+      - SECURITY_TXT_ENCRYPTION=${SECURITY_TXT_ENCRYPTION:-}
+      - SECURITY_TXT_ACKNOWLEDGMENTS=${SECURITY_TXT_ACKNOWLEDGMENTS:-}
+      - SECURITY_TXT_PREFERRED_LANGUAGES=${SECURITY_TXT_PREFERRED_LANGUAGES:-en}
+      - SECURITY_TXT_POLICY=${SECURITY_TXT_POLICY:-}
+      - SECURITY_TXT_HIRING=${SECURITY_TXT_HIRING:-}
     volumes:
       # Directory mounts, not single-file mounts: a single-file bind mount is
       # bound to that file's inode, and an edit that replaces the file (write

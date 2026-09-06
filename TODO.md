@@ -188,6 +188,15 @@ more real than a laptop demo:
 
 ## Known limitations / not fully verified
 
+- **`security.txt`'s `Expires` field doesn't recompute on a timer** — only
+  when `envoy-control-plane` actually rebuilds its config (startup, or a
+  routes.csv/ssl file change). A deployment that goes a long time with
+  none of those will serve a `security.txt` whose `Expires` date quietly
+  drifts into the past. Touching `routes.csv` (even a no-op save) or
+  restarting the container refreshes it. Not signed (RFC 9116 §2.5.3
+  supports an OpenPGP cleartext signature) — that needs a real private
+  key, the same class of prerequisite as Let's Encrypt/GeoIP's real
+  credentials, and isn't built here.
 - **The attack map doesn't handle the antimeridian (lon ±180).** An
   attacker near +179° and a server near -179° draws an arc the "long way"
   around the map instead of wrapping across the edge — a cosmetic edge

@@ -8,6 +8,23 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **`security_txt.go`: a customizable RFC 9116 `security.txt`**, served by
+  `envoy-control-plane` itself for every `routes.csv` domain at both
+  `/.well-known/security.txt` (canonical) and `/security.txt` (legacy,
+  still widely checked) — a direct response, no upstream, no scoring,
+  same treatment as the default-site fallback. Off entirely unless
+  `SECURITY_TXT_CONTACT` is set (RFC 9116 makes Contact mandatory, so
+  without one there's no valid file to publish at all); every other field
+  (Encryption, Acknowledgments, Preferred-Languages, Policy, Hiring) is
+  optional and `.env`-driven. `Expires` is computed fresh from
+  `SECURITY_TXT_EXPIRES_DAYS` every time the config rebuilds, and
+  `Canonical` is generated per-domain. Verified live: off by default
+  (falls through to the real backend, confirmed by checking the actual
+  response body, not just the status code — the echo backend returns 200
+  for any path regardless), correct content once enabled for two
+  different domains, `ext_authz` genuinely bypassed (no `x-risk-score`
+  header), and no regression to normal scored traffic on the same domain.
+
 - **Hover tooltips on attack-map markers**, and a progressively "drawn"
   line instead of the arc appearing all at once. Hovering a marker (an
   attacker, the server, or the private-IP point) shows its IP, resolved
