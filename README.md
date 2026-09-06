@@ -31,6 +31,7 @@ time, asynchronously, rather than adding a third fragile real-time one.
                                  │                        └─────▶ coraza-service (OWASP CRS)
                                  │
                                  ├──routes.csv target────▶ backend
+                                 ├──unmatched, Host=raw IP▶ scored too (crs-extra rule 10002)
                                  └──unmatched domain─────▶ answered directly by Envoy
                                                             (DirectResponseAction, no upstream)
 
@@ -55,6 +56,12 @@ ban an IP outright rather than only via CrowdSec's usual repeated-403
 pattern. Separately and asynchronously, `crs-tuner` never sits on the
 request path at all — it only ever changes what CRS itself does for
 *future* requests, and only after repeated, independent agreement.
+
+Two directories extend CRS core, opposite directions: `crs-exclusions/`
+*narrows* it (hand-written or `crs-tuner`-generated exceptions for known
+false positives), `coraza-service/crs-extra/` *adds* to it — hand-authored
+rules covering gaps CRS core doesn't (IDs 1-29999, see
+`crs-extra/README.conf`). Both hot-reload the same way, no restart needed.
 
 ## Services
 

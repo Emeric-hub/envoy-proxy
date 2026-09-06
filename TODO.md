@@ -229,3 +229,14 @@ more real than a laptop demo:
   `cscli bouncers delete scoring` (inside the `crowdsec` container) and
   restart it. Only matters after the first `docker compose up`; a fresh
   clone via `init.sh` + first startup is unaffected.
+- **`crs-extra/scanner-recon.conf`'s rule `10001` assumes the real backend
+  never legitimately serves `/wp-admin`, `/phpmyadmin`, etc.** True for this
+  demo's echo backend; a deployment that actually runs WordPress or
+  phpMyAdmin on a scored domain must adjust the path list first, same
+  caveat class as any signal that assumes what "normal" looks like for the
+  real app behind it.
+- **Rule `10002` (raw-IP `Host`) is IPv4-literal only** — no bracketed IPv6
+  (`[::1]`) matching, on either the Coraza regex or the
+  `envoy-control-plane` `:authority` route match that makes the request
+  reachable in the first place. Extend both regexes together if this
+  matters for a real deployment.

@@ -68,6 +68,13 @@ var (
 	acmeHttp01Port       uint32        // fixed port for Let's Encrypt's HTTP-01 challenge — always 80 in real use, that's the ACME protocol's requirement, not configurable on their end
 )
 
+// defaultCatchAllRoute is a synthetic routes.csv row — not read from the
+// CSV — backing vh_default's IP-literal-Host branch (see buildRouteConfig).
+// Same backend/port/cert-check as every real row: there's only one backend
+// in this demo, and this branch exists to get the request scored, not to
+// reach a different upstream.
+var defaultCatchAllRoute = route{ID: "default", Domain: "*", Target: "backend", Port: 8443, Scoring: true}
+
 type route struct {
 	ID          string
 	Domain      string
@@ -848,24 +855,65 @@ func buildRouteConfig(routes []route, name string, responseHeaders []*corev3.Hea
 		}
 		vhosts = append(vhosts, vh)
 	}
-	// No upstream at all for unmatched domains — Envoy answers directly
-	// (DirectResponseAction) from the mounted envoy/default-site/index.html,
-	// read fresh on every rebuild (see apply()), not compiled into the
-	// binary. Content-type is set here (Route-level response_headers_to_add)
-	// rather than at the RouteConfiguration level, since that level's
-	// headers apply to every other route too, most of which proxy to
-	// backends with their own real content-types.
+	// vh_default catches every Host that doesn't match a configured domain.
+	// Two routes, evaluated in order (first match wins):
+	//
+	//  1. Host is an IP literal (e.g. a scanner hitting the proxy directly
+	//     by its public IP instead of any real domain — a recon pattern
+	//     real domain traffic never produces). This one *proxies* to a real
+	//     backend instead of DirectResponseAction, specifically so it goes
+	//     through ext_authz/Coraza and can actually be scored — verified
+	//     empirically that a DirectResponseAction route never invokes
+	//     ext_authz at all (no scoring-service log entry for such a
+	//     request), so there was previously no way to flag this traffic.
+	//     Coraza's crs-extra rule 10002 does the actual IP-literal check on
+	//     REQUEST_HEADERS:Host; this regex only needs to be loose enough to
+	//     select the branch, not authoritative.
+	//  2. Everything else unmatched (typos, stale DNS, scanners probing
+	//     other hostnames) — the original DirectResponseAction, unchanged:
+	//     from the mounted envoy/default-site/index.html, read fresh on
+	//     every rebuild (see apply()), not compiled into the binary.
+	//     Content-type is set here (Route-level response_headers_to_add)
+	//     rather than at the RouteConfiguration level, since that level's
+	//     headers apply to every other route too, most of which proxy to
+	//     backends with their own real content-types.
 	vhosts = append(vhosts, &routev3.VirtualHost{
 		Name:    "vh_default",
 		Domains: []string{"*"},
-		Routes: []*routev3.Route{{
-			Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
-			Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
-				Status: 200,
-				Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: defaultSiteBody}},
-			}},
-			ResponseHeadersToAdd: []*corev3.HeaderValueOption{headerOpt("content-type", "text/html; charset=utf-8")},
-		}},
+		Routes: []*routev3.Route{
+			{
+				Match: &routev3.RouteMatch{
+					PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
+					Headers: []*routev3.HeaderMatcher{{
+						Name: ":authority",
+						HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{
+							StringMatch: &matcherv3.StringMatcher{
+								MatchPattern: &matcherv3.StringMatcher_SafeRegex{
+									SafeRegex: &matcherv3.RegexMatcher{Regex: `^(\d{1,3}\.){3}\d{1,3}(:\d+)?$`},
+								},
+							},
+						},
+					}},
+				},
+				Action: &routev3.Route_Route{Route: &routev3.RouteAction{
+					ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "cluster_" + defaultCatchAllRoute.ID},
+					Timeout:          durationpb.New(requestTimeout),
+				}},
+			},
+			{
+				Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
+				Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
+					Status: 200,
+					Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: defaultSiteBody}},
+				}},
+				ResponseHeadersToAdd: []*corev3.HeaderValueOption{headerOpt("content-type", "text/html; charset=utf-8")},
+				TypedPerFilterConfig: map[string]*anypb.Any{
+					"envoy.filters.http.ext_authz": mustAny(&extauthzv3.ExtAuthzPerRoute{
+						Override: &extauthzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+					}),
+				},
+			},
+		},
 	})
 	return &routev3.RouteConfiguration{
 		Name:                    name,
@@ -924,7 +972,7 @@ func (g *generator) apply(ctx context.Context, routes []route) error {
 			},
 		}),
 	}
-	clusters := []cachetypes.Resource{scoringCluster}
+	clusters := []cachetypes.Resource{scoringCluster, buildRouteCluster(defaultCatchAllRoute)}
 	for _, r := range routes {
 		clusters = append(clusters, buildRouteCluster(r))
 	}

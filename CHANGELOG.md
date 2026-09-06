@@ -38,6 +38,33 @@ compress a lot of iteration into each entry.
   the running total (same rolling-sampled-gauge pattern as the existing
   queue-depth chart), appearing only once something's actually been
   generated.
+- **Two hand-authored `crs-extra/` rules** (IDs `10001`/`10002`, in the
+  1-29999 range reserved for this folder — see `crs-extra/README.conf`)
+  filling gaps CRS core doesn't cover:
+  - `10001`: CMS/framework admin-panel and management-endpoint recon
+    (`/wp-admin`, `/phpmyadmin`, `/xmlrpc.php`, `/server-status`,
+    `/actuator/health`, ...). Verified this doesn't overlap CRS's own rule
+    `930130` (`restricted-files.data`, 765 entries) before writing it —
+    that rule covers file/credential/VCS-metadata *exposure* (`.env`,
+    `.git/`, `wp-config.*`, ...), not admin-panel *recon*, a different
+    category. A honeypot-route approach (Go code in `scoring-service-go`)
+    was built and verified first, then reverted in favor of this — same
+    detection, but as a native CRS rule instead of a parallel, harder-to
+    maintain path-list living outside the WAF.
+  - `10002`: a request whose `Host` is a raw IP literal instead of a real
+    domain. This one required an `envoy-control-plane` change to even be
+    reachable: verified that `vh_default`'s catch-all
+    (`DirectResponseAction`, the static "No site configured" page) never
+    invokes `ext_authz` at all — a raw-IP `Host` never matches a
+    configured domain, so it fell through to that catch-all and Coraza
+    never saw it. `vh_default` now has a dedicated, `:authority`-regex-matched
+    route (IPv4 literal, optional port) that proxies through
+    `ext_authz`/Coraza instead of answering directly; every other
+    unmatched domain (typos, stale DNS) still gets the static page,
+    unscored, exactly as before. In practice this rule's own CRITICAL
+    match combines with CRS core's existing `920350` ("Host header is a
+    numeric IP address", WARNING) and `920300` (NOTICE) to cross
+    `RISK_THRESHOLD` outright on the very first request — verified live.
 - **`crs-tuner`'s prompt now judges the matched value on its own content,
   not just which rule category matched it.** Found and fixed a real gap:
   a generic protocol-enforcement rule (e.g. 920273, "invalid character")
