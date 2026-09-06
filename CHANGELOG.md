@@ -8,6 +8,14 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **Real-time traffic highlight on the "front domain → backend target"
+  topology diagram.** Each request briefly flashes the domain chip, the
+  target chip, and the connecting curve it actually took, plus a dot that
+  travels along that exact curve (SVG `<animateMotion>` against the
+  curve's own path data — simpler than a requestAnimationFrame loop for a
+  handful of short-lived dots). Batched per 1s tick like the globe/threat
+  counter above, collapsed to one flash per domain per tick under a burst.
+
 - **Dashboard "bling": a live 3D attack globe + an animated threats-blocked
   counter.** A rotating wireframe globe (three.js, no texture asset — a
   procedural dotted/wireframe sphere fits the theme and needs nothing

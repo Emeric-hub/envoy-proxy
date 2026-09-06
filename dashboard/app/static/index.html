@@ -86,6 +86,15 @@
     position: absolute; bottom: 4px; left: 0; right: 0; text-align: center;
     font-size: 0.65rem; color: #6b7280; pointer-events: none;
   }
+
+  /* Topology diagram: real-traffic highlight. CSS wins over the SVG
+     presentation attributes set inline (stroke-width, opacity) per the
+     normal SVG/CSS cascade, so these classes can override them without
+     touching the generated markup itself. */
+  .topo-link { transition: stroke-width 0.15s ease-out, opacity 0.15s ease-out; }
+  .topo-link.topo-flash { stroke-width: 3.5 !important; opacity: 1 !important; }
+  .topo-chip { transition: stroke 0.15s ease-out, stroke-width 0.15s ease-out; }
+  .topo-chip.topo-flash { stroke: #60a5fa !important; stroke-width: 2.2 !important; }
 </style>
 <!--ACTIVE_CONFIG-->
 </head>
@@ -167,6 +176,7 @@ const DONUT_COLORS = ['#60a5fa', '#4ade80', '#f87171', '#facc15', '#a78bfa', '#f
 
 let events = []; // chronological, oldest first
 let pendingBlocked = []; // deny-event source IPs since the last 1s tick — drained by drainGlobeQueue()
+let pendingTopologyFlashes = []; // {domain, decision} since the last 1s tick — drained by drainTopologyFlashes()
 
 const filters = { ip: '', path: '', domain: '', decision: 'all' };
 
@@ -452,6 +462,7 @@ function tick() {
   renderTableAndStats();
   renderCharts();
   drainGlobeQueue();
+  drainTopologyFlashes();
 }
 
 // addEvent must stay O(1): under real traffic this fires far more than once a
@@ -468,6 +479,77 @@ function addEvent(ev) {
     pendingBlocked.push(ev.ip);
     bumpThreatCounter();
   }
+  pendingTopologyFlashes.push({ domain: ev.domain, decision: ev.decision });
+}
+
+// ---- Topology diagram: real-time traffic highlight --------------------
+// Same batch-per-tick discipline as the globe above, for the same reason:
+// under a fast burst, flashing per event would spawn a new SVG circle +
+// SMIL animation per request. Collapsing to one flash per domain per tick
+// also just reads better — a domain being hammered doesn't need N
+// overlapping dots, only "this link is busy right now."
+const TOPOLOGY_MAX_FLASH_PER_TICK = 20;
+
+function drainTopologyFlashes() {
+  if (!pendingTopologyFlashes.length) return;
+  const batch = pendingTopologyFlashes;
+  pendingTopologyFlashes = [];
+  const lastDecisionByDomain = new Map();
+  for (const { domain, decision } of batch) lastDecisionByDomain.set(domain, decision);
+  let spawned = 0;
+  for (const [domain, decision] of lastDecisionByDomain) {
+    if (spawned >= TOPOLOGY_MAX_FLASH_PER_TICK) break;
+    flashTopologyLink(domain, decision === 'deny' ? '#f87171' : '#4ade80');
+    spawned++;
+  }
+}
+
+function retriggerFlash(el) {
+  el.classList.remove('topo-flash');
+  void el.offsetWidth; // force reflow so re-adding the class restarts the transition mid-burst
+  el.classList.add('topo-flash');
+  clearTimeout(el._topoFlashTimer); // a prior flash still fading on this element shouldn't clear before this newer one
+  el._topoFlashTimer = setTimeout(() => el.classList.remove('topo-flash'), 500);
+}
+
+function flashChipClass(selector, value) {
+  const svg = document.getElementById('topology-svg');
+  for (const el of svg.querySelectorAll(selector)) {
+    if (el.dataset.domain === value || el.dataset.target === value) retriggerFlash(el);
+  }
+}
+
+// Highlights the domain->target link a request actually took: a brief
+// stroke flash on the curve and both chips, plus a dot that travels along
+// the exact same path data via SMIL <animateMotion> — cheaper and simpler
+// than a requestAnimationFrame loop for a handful of short-lived dots, and
+// it naturally follows the curve's own shape with no extra math.
+function flashTopologyLink(domain, color) {
+  const svg = document.getElementById('topology-svg');
+  if (!svg) return;
+  let link = null;
+  for (const p of svg.querySelectorAll('path.topo-link')) {
+    if (p.dataset.domain === domain) { link = p; break; }
+  }
+  if (!link) return; // domain not in the current topology snapshot (e.g. scoring-disabled route, or stale between 5s polls)
+
+  flashChipClass('rect.topo-chip[data-domain]', domain);
+  const targetKey = targetForDomain(domain);
+  if (targetKey && targetKey !== '—') flashChipClass('rect.topo-chip[data-target]', targetKey);
+
+  retriggerFlash(link);
+
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const dot = document.createElementNS(svgNS, 'circle');
+  dot.setAttribute('r', '3.5');
+  dot.setAttribute('fill', color);
+  const anim = document.createElementNS(svgNS, 'animateMotion');
+  anim.setAttribute('dur', '0.7s');
+  anim.setAttribute('repeatCount', '1');
+  anim.setAttribute('path', link.getAttribute('d'));
+  dot.appendChild(anim);
+  svg.appendChild(dot);
+  setTimeout(() => dot.remove(), 750); // animateMotion has no reliable cross-browser "done" event; a timeout matching dur is simpler than wiring endEvent
 }
 
 // ---- Threats-blocked counter + 3D "attack globe" ----------------------
@@ -789,12 +871,12 @@ function renderTopology(backends, letsencrypt) {
     for (const d of (b.domains || [])) {
       const dy = domainY.get(d) + chipH / 2;
       const cx = (midX1 + midX2) / 2;
-      parts.push(`<path d="M${midX1},${dy} C${cx},${dy} ${cx},${ty} ${midX2},${ty}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.5" />`);
+      parts.push(`<path class="topo-link" data-domain="${escapeHtml(d)}" d="M${midX1},${dy} C${cx},${dy} ${cx},${ty} ${midX2},${ty}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.5" />`);
     }
   }
   for (const d of domains) {
     const y = domainY.get(d);
-    parts.push(`<rect x="${leftX}" y="${y}" width="${leftChipW}" height="${chipH}" rx="8" fill="#0f1115" stroke="#2a2f3a" />`);
+    parts.push(`<rect class="topo-chip" data-domain="${escapeHtml(d)}" x="${leftX}" y="${y}" width="${leftChipW}" height="${chipH}" rx="8" fill="#0f1115" stroke="#2a2f3a" />`);
     parts.push(`<text x="${leftX + leftChipW / 2}" y="${y + chipH / 2 + 3}" font-size="9" fill="#e6e6e6" text-anchor="middle">${escapeHtml(truncate(d, 20))}</text>`);
     const le = letsencrypt[d];
     if (le && le.enabled) {
@@ -815,7 +897,7 @@ function renderTopology(backends, letsencrypt) {
     const title = b.up
       ? `up — checked ${b.checked_at || 'unknown'}`
       : `down — ${b.error || 'unreachable'}, checked ${b.checked_at || 'unknown'}`;
-    parts.push(`<rect x="${rightX}" y="${y}" width="${rightChipW}" height="${chipH}" rx="8" fill="#0f1115" stroke="${color}" stroke-width="1.3"><title>${escapeHtml(title)}</title></rect>`);
+    parts.push(`<rect class="topo-chip" data-target="${escapeHtml(key)}" x="${rightX}" y="${y}" width="${rightChipW}" height="${chipH}" rx="8" fill="#0f1115" stroke="${color}" stroke-width="1.3"><title>${escapeHtml(title)}</title></rect>`);
     parts.push(`<circle cx="${rightX + 10}" cy="${y + chipH / 2}" r="3" fill="${color}" />`);
     parts.push(`<text x="${rightX + 18}" y="${y + chipH / 2 + 3}" font-size="9" fill="#e6e6e6">${escapeHtml(truncate(key, 14))}</text>`);
   }
