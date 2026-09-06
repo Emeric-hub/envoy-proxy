@@ -188,6 +188,11 @@ more real than a laptop demo:
 
 ## Known limitations / not fully verified
 
+- **The attack map doesn't handle the antimeridian (lon ±180).** An
+  attacker near +179° and a server near -179° draws an arc the "long way"
+  around the map instead of wrapping across the edge — a cosmetic edge
+  case (see `projectLatLon`'s doc comment in `dashboard/app/static/index.html`),
+  not worth the extra complexity for how rarely it'd actually come up.
 - **`letsencrypt-sidecar` only supports HTTP-01**, not DNS-01 — no
   wildcard certs, and it needs port 80 reachable from the real internet.
   DNS-01 would remove that requirement but needs DNS provider API

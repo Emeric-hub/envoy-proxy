@@ -359,6 +359,13 @@ services:
       - ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-true}
       - ENABLE_AI_TUNER=${ENABLE_AI_TUNER:-true}
       - ENABLE_GEOIP=${ENABLE_GEOIP:-false}
+      # Attack map's fixed reference point — see dashboard/app/main.py's
+      # api_server_location(). Resolved through geoip-service directly
+      # (independent of ENABLE_GEOIP, which only gates scoring-service's
+      # per-request enrichment); empty by default, map just omits the
+      # marker.
+      - SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP:-}
+      - GEOIP_URL=http://geoip-service:8092/lookup
       # For the live ai-tuner/ollama connectivity check — same source as
       # crs-tuner's own OLLAMA_URL/OLLAMA_API_KEY. The key is only ever used
       # server-side for that check, never sent to the browser — only whether

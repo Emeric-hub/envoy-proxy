@@ -6,6 +6,26 @@ compress a lot of iteration into each entry.
 
 ## [Unreleased]
 
+### Changed
+
+- **Replaced the 3D "attack globe" with a 2D, GeoIP-centric attack map.**
+  The rotating three.js globe wasn't actually useful — real information
+  (which countries, how close to the server) was hard to read off an
+  abstract rotating sphere. Now a flat, real (CC BY-SA 3.0, Al MacDonald /
+  Fritz Lekschas) equirectangular world map, with this deployment's own
+  location (`SERVER_PUBLIC_IP`, resolved through geoip-service — a new
+  `/api/server-location` dashboard endpoint) as a fixed reference point,
+  and every blocked request drawn as an animated arc from the attacker's
+  location to it (SVG `animateMotion`, same technique as the topology
+  diagram's traveling dot). Attacker placement still falls back to the
+  same deterministic IP-hash when GeoIP doesn't resolve one; the map falls
+  back to a plain dot map (no arcs) when the server's own location isn't
+  configured, rather than drawing lines to a made-up destination. Verified
+  live: server marker resolves and renders correctly, arcs animate from
+  real attacker locations and clean up after, and the whole thing renders
+  with zero console errors. Net simplification too — three.js and its CDN
+  script tag are gone entirely, replaced by plain SVG.
+
 ### Added
 
 - **`tests/perf-impact-test.sh`: measures the real latency cost of each

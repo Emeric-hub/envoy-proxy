@@ -76,7 +76,7 @@ rules covering gaps CRS core doesn't (IDs 1-29999, see
 | `ollama`               | Local LLM inference for `crs-tuner` (optional — can point elsewhere)|
 | `claude-shim`          | Alternative to `ollama`: Ollama-API-compatible, backed by `claude -p` (see `claude-shim/README.md`) |
 | `letsencrypt-sidecar`  | Opt-in: issues/renews real TLS certs for `routes.csv` domains flagged `letsencrypt=true` |
-| `geoip-service`        | Opt-in: local MaxMind GeoLite2-City lookups, enriches events for the dashboard's attack globe (needs a MaxMind account+key) |
+| `geoip-service`        | Opt-in: local MaxMind GeoLite2-City lookups, enriches events for the dashboard's attack map (needs a MaxMind account+key) |
 | `dashboard`            | Live WebSocket dashboard — traffic, scores, topology, backend health|
 | `redis`                | Pub/sub + stream transport (dashboard events, `crs-tuner`'s queue)  |
 | `backend`              | Demo upstream (`mendhak/http-https-echo`) — echoes request details  |

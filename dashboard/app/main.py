@@ -20,6 +20,13 @@ CRS_TUNER_GROUP = "crs-tuner"
 SCORING_SERVICE_URL = os.environ.get("SCORING_SERVICE_URL", "http://scoring-service:8001")
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://envoy-control-plane:18001")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+GEOIP_URL = os.environ.get("GEOIP_URL", "http://geoip-service:8092/lookup")
+# Optional — the attack map's fixed reference point (see api_server_location
+# below). Resolved through the already-local geoip-service, same as every
+# attacker IP; no new third-party call. Left unset, the map just shows
+# attacker markers with no line to draw one to, rather than pointing at a
+# made-up destination.
+SERVER_PUBLIC_IP = os.environ.get("SERVER_PUBLIC_IP", "").strip()
 # Server-side only — used to authenticate the live check below, never sent
 # to the browser. STATIC_CONFIG exposes only whether it's set (bool).
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
@@ -240,6 +247,31 @@ async def api_backends() -> JSONResponse:
     except Exception:
         logger.warning("envoy-control-plane backend health check unreachable", exc_info=True)
         return JSONResponse({"backends": []})
+
+
+@app.get("/api/server-location")
+async def api_server_location() -> JSONResponse:
+    """Resolves SERVER_PUBLIC_IP through geoip-service — the attack map's
+    fixed reference point. Same fail-soft posture as every other geoip
+    lookup in this project: not configured, geoip-service unreachable, and
+    "IP not found in the database" are all indistinguishable to the caller
+    (configured/found flags only) — the map just omits the server marker
+    rather than guessing. Not proxying scoring-service's own geoip client
+    here since that one only ever looks up *request* IPs, not this fixed
+    one — a direct call to geoip-service is simpler than routing this
+    through a service that has nothing to do with it."""
+    if not SERVER_PUBLIC_IP:
+        return JSONResponse({"configured": False, "found": False})
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            response = await client.get(GEOIP_URL, params={"ip": SERVER_PUBLIC_IP})
+            response.raise_for_status()
+            data = response.json()
+            data["configured"] = True
+            return JSONResponse(data)
+    except Exception:
+        logger.warning("geoip-service unreachable for server-location lookup", exc_info=True)
+        return JSONResponse({"configured": True, "found": False})
 
 
 @app.get("/api/ollama-status")
