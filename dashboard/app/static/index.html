@@ -80,13 +80,28 @@
     flex: 1; background: #05070c; border-radius: 8px; padding: 0.5rem;
     position: relative; height: 300px; overflow: hidden; min-width: 320px;
   }
-  .map-box svg { width: 100%; height: 100%; display: block; }
+  .map-box svg { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  .map-box svg.panning { cursor: grabbing; }
   .map-box .hint {
     position: absolute; bottom: 4px; left: 0; right: 0; text-align: center;
     font-size: 0.65rem; color: #6b7280; pointer-events: none;
   }
+  .map-box .map-legend {
+    position: absolute; top: 6px; left: 8px; background: rgba(5,7,12,0.7);
+    border-radius: 6px; padding: 0.3rem 0.5rem; display: flex; flex-direction: column;
+    gap: 0.15rem; font-size: 0.65rem; color: #9aa0aa; pointer-events: none;
+  }
+  .map-box .map-legend .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    margin-right: 0.35rem; vertical-align: middle;
+  }
+  /* World-map borders/marker rings keep a constant on-screen stroke width
+     regardless of zoom (vector-effect="non-scaling-stroke", set inline on
+     those elements) — a plain scaled stroke goes from crisp to smeared as
+     soon as the map is zoomed in, which is the whole point of adding pan/zoom. */
   #world-map-land { fill: #1a1d24; stroke: #2a2f3a; stroke-width: 0.5; }
-  .map-server-marker circle { fill: none; stroke: #60a5fa; }
+  #world-map-land path { vector-effect: non-scaling-stroke; }
+  .map-server-marker circle { fill: none; stroke: #60a5fa; vector-effect: non-scaling-stroke; }
   .map-server-marker .server-core { fill: #60a5fa; stroke: none; }
   .map-server-label { fill: #9aa0aa; font-size: 9px; }
   .attack-arc { fill: none; stroke-linecap: round; }
@@ -129,6 +144,7 @@
      Per-country path IDs (ISO 3166-1) kept as-is from the source; unused
      here (no per-country interactivity), just left intact rather than
      stripped. -->
+<g id="map-viewport">
 <g id="world-map-land">
     <path id="_somaliland" d="M512.674,502.797l3.526,2.403l1.046-0.052l8.757-3.008l0.994,3.206l-0.701,2.706l-1.893,1.503l-4.729-0.302l-6.769-4.158L512.674,502.797L512.674,502.797z"/>
     <path id="ae" d="M528.466,468.135l0.753,3.008l8.522,0.752l0.596-6.172l1.644-0.897l0.448-2.257l-2.688,0.753l-2.99,4.521L528.466,468.135L528.466,468.135z"/>
@@ -521,7 +537,13 @@
 </g>
         <g id="map-server-layer"></g>
         <g id="map-attack-layer"></g>
+      </g>
       </svg>
+      <div class="map-legend">
+        <span><i class="dot" style="background:#60a5fa"></i>server</span>
+        <span><i class="dot" style="background:#f87171"></i>attacker</span>
+        <span><i class="dot" style="background:#9ca3af"></i>private/internal IP</span>
+      </div>
       <div class="hint">recent blocked requests — real GeoIP when geoip-service resolves the IP, an illustrative IP-hash placement otherwise</div>
     </div>
   </div>
@@ -995,10 +1017,45 @@ function hashToLatLon(ip) {
   return [lat, lon];
 }
 
+// RFC1918/loopback/link-local IPv4, plus a rough IPv6 equivalent (::1,
+// unique-local fc00::/7) — GeoLite2 has no entry for any of these (they're
+// not routable on the public internet), so scoring-service's geo_found is
+// always false for them anyway. Called out separately from "geoip just
+// didn't resolve this one" because it's a distinct, common, and
+// meaningful case in this demo specifically: the Docker bridge gateway
+// (e.g. 172.18.0.1) is the source IP for basically all same-host curl
+// testing, and scattering it across the map via the hash fallback would
+// misleadingly suggest a real external origin for what is, structurally,
+// never one.
+function isPrivateOrLoopbackIP(ip) {
+  if (!ip) return false;
+  if (ip === '::1') return true;
+  const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (!m) return /^f[cd]/i.test(ip); // fc00::/7 unique-local, rough prefix check
+  const a = Number(m[1]), b = Number(m[2]);
+  return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+}
+
+// "Null Island" (0°N 0°E) — the conventional GIS placeholder for "no real
+// location," not a random guess. Every private/loopback IP collapses onto
+// this exact same point (not scattered like the hash fallback below),
+// which is the point: it should read as one deliberate "internal traffic"
+// marker, not as N distinct (fake) attacker locations.
+const NULL_ISLAND = [0, 0];
+
+const MAP_COLORS = { attack: '#f87171', private: '#9ca3af' };
+function markerCategory(ip) {
+  return isPrivateOrLoopbackIP(ip) ? 'private' : 'attack';
+}
+
 // Real GeoIP when scoring-service actually resolved one (ENABLE_GEOIP on,
 // geoip-service reachable, IP not in a private/reserved range) — the hash
 // fallback otherwise, same as when geoip-service isn't running at all.
+// Private/loopback IPs are checked first and always win: GeoLite2 can
+// never resolve one for real, so entry.geoFound is always false for them
+// anyway, and they'd otherwise fall into the misleading hash fallback.
 function markerLatLon(entry) {
+  if (isPrivateOrLoopbackIP(entry.ip)) return NULL_ISLAND;
   if (entry.geoFound && typeof entry.lat === 'number' && typeof entry.lon === 'number') return [entry.lat, entry.lon];
   return hashToLatLon(entry.ip);
 }
@@ -1035,12 +1092,12 @@ function svgEl(tag, attrs) {
 // small solid core (stays visible as a distinct dot) plus a larger, more
 // transparent halo behind it so it actually pops against the dark map
 // fill rather than reading as an almost-invisible speck.
-function upsertMapMarker(ip, lat, lon) {
+function upsertMapMarker(ip, lat, lon, color) {
   let m = mapMarkers.get(ip);
   if (!m) {
     const [x, y] = projectLatLon(lat, lon);
-    const halo = svgEl('circle', { cx: x, cy: y, r: 5, fill: '#f87171', opacity: 0.35 });
-    const core = svgEl('circle', { cx: x, cy: y, r: 2, fill: '#f87171', opacity: 1 });
+    const halo = svgEl('circle', { cx: x, cy: y, r: 5, fill: color, opacity: 0.35 });
+    const core = svgEl('circle', { cx: x, cy: y, r: 2, fill: color, opacity: 1 });
     document.getElementById('map-attack-layer').append(halo, core);
     m = { core, halo };
     mapMarkers.set(ip, m);
@@ -1068,7 +1125,7 @@ function pruneMapMarkers(now) {
 // along the exact same path data via SMIL <animateMotion> — same
 // technique as the topology diagram's traveling dot (flashTopologyLink),
 // reused here rather than inventing a second animation approach.
-function spawnAttackArc(lat, lon) {
+function spawnAttackArc(lat, lon, color) {
   if (!serverLocation) return; // dot-map fallback mode — nothing to draw a line to
   const [ax, ay] = projectLatLon(lat, lon);
   const [sx, sy] = projectLatLon(serverLocation.lat, serverLocation.lon);
@@ -1080,7 +1137,7 @@ function spawnAttackArc(lat, lon) {
   const d = `M${ax},${ay} Q${cx},${cy} ${sx},${sy}`;
 
   const layer = document.getElementById('map-attack-layer');
-  const arc = svgEl('path', { class: 'attack-arc', d, stroke: '#f87171', 'stroke-width': 1, opacity: 0.8 });
+  const arc = svgEl('path', { class: 'attack-arc', d, stroke: color, 'stroke-width': 1, opacity: 0.8 });
   layer.appendChild(arc);
 
   const dot = svgEl('circle', { r: 2.2, fill: '#facc15' });
@@ -1102,9 +1159,10 @@ function drainAttackMapQueue() {
   pendingBlocked = [];
   let spawned = 0;
   for (const entry of batch) {
+    const color = MAP_COLORS[markerCategory(entry.ip)];
     const [lat, lon] = markerLatLon(entry);
-    upsertMapMarker(entry.ip, lat, lon);
-    if (spawned < MAP_MAX_ARCS_PER_TICK) { spawnAttackArc(lat, lon); spawned++; }
+    upsertMapMarker(entry.ip, lat, lon, color);
+    if (spawned < MAP_MAX_ARCS_PER_TICK) { spawnAttackArc(lat, lon, color); spawned++; }
   }
 }
 
@@ -1137,9 +1195,114 @@ async function pollServerLocation() {
   renderServerMarker();
 }
 
+// ---- Map zoom/pan --------------------------------------------------------
+// A single transform (translate + scale) on #map-viewport, which wraps the
+// world outline *and* both marker layers — panning/zooming moves markers
+// and arcs in lockstep with the map under them, not just the background.
+// Deliberately a hand-rolled wheel+pointer implementation rather than a
+// library: this is the one interaction the map needs, and d3-zoom/similar
+// would be a lot of new dependency weight for exactly one gesture.
+const mapView = { scale: 1, tx: 0, ty: 0 };
+const MAP_SCALE_MIN = 1, MAP_SCALE_MAX = 8;
+
+function clampMapView() {
+  mapView.scale = Math.min(MAP_SCALE_MAX, Math.max(MAP_SCALE_MIN, mapView.scale));
+  // Generous rather than exact bounds — just keeps the map from being
+  // dragged so far that nothing recognizable is left on screen, without
+  // needing to know the viewport's exact on-screen pixel size in SVG
+  // user-space (which varies with the box's actual rendered aspect ratio).
+  const maxPan = (mapView.scale - 1) * MAP_VB.w * 0.6;
+  mapView.tx = Math.min(maxPan, Math.max(-maxPan, mapView.tx));
+  mapView.ty = Math.min(maxPan, Math.max(-maxPan, mapView.ty));
+}
+
+function applyMapView() {
+  const g = document.getElementById('map-viewport');
+  if (g) g.setAttribute('transform', `translate(${mapView.tx},${mapView.ty}) scale(${mapView.scale})`);
+}
+
+function setupMapZoomPan() {
+  const svg = document.getElementById('attack-map-svg');
+
+  // SVG user-space coordinates for a mouse/pointer event, independent of
+  // the box's actual rendered CSS size — getScreenCTM() is exactly the
+  // "screen pixels -> SVG viewBox units" matrix for this purpose.
+  function toSvgPoint(clientX, clientY) {
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
+  }
+
+  // #map-viewport's transform is translate(tx,ty) scale(s), which maps a
+  // *content* point c (raw path coordinates) to viewBox space as
+  // v = s*c + (tx,ty). getScreenCTM() on the outer, never-transformed
+  // <svg> converts a screen point straight to v — that part needs no
+  // before/after comparison, it's the same fixed conversion regardless of
+  // zoom. What needs the current transform is going the other way, v -> c
+  // (c = (v - (tx,ty)) / s), so the cursor's *content*-space position can
+  // be held fixed while s changes: new tx/ty are solved from
+  // v == sNew*c + (txNew,tyNew).
+  svg.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const v = toSvgPoint(e.clientX, e.clientY);
+    const cx = (v.x - mapView.tx) / mapView.scale;
+    const cy = (v.y - mapView.ty) / mapView.scale;
+    const factor = e.deltaY < 0 ? 1.2 : 1 / 1.2;
+    mapView.scale = Math.min(MAP_SCALE_MAX, Math.max(MAP_SCALE_MIN, mapView.scale * factor));
+    mapView.tx = v.x - cx * mapView.scale;
+    mapView.ty = v.y - cy * mapView.scale;
+    clampMapView();
+    applyMapView();
+  }, { passive: false });
+
+  let dragging = false, lastX = 0, lastY = 0, moved = false;
+  svg.addEventListener('pointerdown', (e) => {
+    dragging = true; moved = false;
+    lastX = e.clientX; lastY = e.clientY;
+    svg.setPointerCapture(e.pointerId);
+    svg.classList.add('panning');
+  });
+  svg.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+    // Screen-pixel delta -> viewBox-unit delta: the outer <svg>'s own
+    // CSS-size-to-viewBox ratio, fixed regardless of the inner zoom level.
+    // tx/ty are applied *after* scale in translate(tx,ty) scale(s) (a
+    // point transforms as s*c + (tx,ty)), so this delta is used as-is —
+    // no dividing by scale, that would undercount the drag at any zoom
+    // level other than 1x.
+    const rect = svg.getBoundingClientRect();
+    const unitsPerPxX = MAP_VB.w / rect.width, unitsPerPxY = MAP_VB.h / rect.height;
+    mapView.tx += dx * unitsPerPxX;
+    mapView.ty += dy * unitsPerPxY;
+    lastX = e.clientX; lastY = e.clientY;
+    clampMapView();
+    applyMapView();
+  });
+  function endDrag(e) {
+    dragging = false;
+    svg.classList.remove('panning');
+  }
+  svg.addEventListener('pointerup', endDrag);
+  svg.addEventListener('pointerleave', endDrag);
+
+  // Double-click resets rather than zooming further in (the usual map-UI
+  // meaning of double-click is the opposite of what's wanted on a box this
+  // small) — also swallows the click that would otherwise land on
+  // whatever's under the cursor right after a drag.
+  svg.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    mapView.scale = 1; mapView.tx = 0; mapView.ty = 0;
+    applyMapView();
+  });
+  svg.addEventListener('click', (e) => { if (moved) e.stopPropagation(); });
+}
+
 function initAttackMap() {
   pollServerLocation();
   setInterval(pollServerLocation, 30000);
+  setupMapZoomPan();
 }
 
 setInterval(tick, 1000);

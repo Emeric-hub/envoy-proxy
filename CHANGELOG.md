@@ -8,6 +8,23 @@ compress a lot of iteration into each entry.
 
 ### Changed
 
+- **Attack map: private/loopback source IPs, a legend, and zoom/pan.**
+  Private/loopback IPs (RFC1918, `127.0.0.0/8`, link-local, `::1`) now
+  collapse onto one fixed, distinctly colored "Null Island" (0°N 0°E — the
+  conventional GIS placeholder, not a guess) marker instead of scattering
+  across the map via the IP-hash fallback, which would otherwise
+  misleadingly suggest a real external origin for what's structurally
+  never one (e.g. the Docker bridge gateway, the source for most local
+  demo testing). A small legend (server / attacker / private-internal-IP)
+  makes the color coding explicit. The map itself now supports mouse-wheel
+  zoom (centered on the cursor) and click-drag pan, with a double-click
+  reset — a hand-rolled implementation (no new library) since it's the one
+  interaction the map needs. Caught and fixed a real bug while verifying
+  live: the initial zoom implementation scaled around the SVG coordinate
+  origin rather than the viewBox's own content, which flew the entire map
+  off-screen after a couple of scroll ticks — screenshotted, diagnosed via
+  the actual transform math, and fixed before considering this done.
+
 - **Replaced the 3D "attack globe" with a 2D, GeoIP-centric attack map.**
   The rotating three.js globe wasn't actually useful — real information
   (which countries, how close to the server) was hard to read off an
