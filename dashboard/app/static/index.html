@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <title>Risk classification — live</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <style>
   body { font-family: system-ui, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 1.5rem; }
   h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 1rem; }
@@ -58,6 +59,33 @@
   .live-dot.down { background: #f87171; box-shadow: 0 0 4px #f87171; }
   .live-dot.unknown { background: #4b5563; }
   .audit-tag { color: #facc15; font-weight: 400; font-size: 0.75em; }
+
+  .bling-row { display: flex; gap: 1rem; margin-bottom: 1rem; }
+  .counter-box {
+    background: radial-gradient(circle at 30% 20%, #2a1013, #1a1d24 70%);
+    border: 1px solid #3a1f22; border-radius: 8px; padding: 1rem 1.5rem;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-width: 220px;
+  }
+  .counter-box .counter-icon { font-size: 1.4rem; margin-bottom: 0.15rem; }
+  .counter-box .value { font-size: 2.6rem; font-weight: 800; color: #f87171; line-height: 1; }
+  .counter-box .label { font-size: 0.72rem; color: #9aa0aa; text-transform: uppercase; margin-top: 0.35rem; text-align: center; }
+  @keyframes threatPulse {
+    0% { transform: scale(1); text-shadow: 0 0 0 rgba(248,113,113,0); }
+    30% { transform: scale(1.18); text-shadow: 0 0 18px rgba(248,113,113,0.9); }
+    100% { transform: scale(1); text-shadow: 0 0 0 rgba(248,113,113,0); }
+  }
+  .counter-box .value.flash { animation: threatPulse 0.6s ease-out; }
+
+  .globe-box {
+    flex: 1; background: #05070c; border-radius: 8px; padding: 0.5rem;
+    position: relative; height: 260px; overflow: hidden; min-width: 260px;
+  }
+  .globe-box #globe-canvas { width: 100%; height: 100%; }
+  .globe-box .hint {
+    position: absolute; bottom: 4px; left: 0; right: 0; text-align: center;
+    font-size: 0.65rem; color: #6b7280; pointer-events: none;
+  }
 </style>
 <!--ACTIVE_CONFIG-->
 </head>
@@ -73,6 +101,18 @@
     <div class="stat"><div class="value" id="stat-rate">0%</div><div class="label">Block rate</div></div>
     <div class="stat"><div class="value" id="stat-avg-duration">0ms</div><div class="label">Avg duration</div></div>
     <div class="stat"><div class="value" id="stat-p95-duration">0ms</div><div class="label">P95 duration</div></div>
+  </div>
+
+  <div class="bling-row">
+    <div class="counter-box">
+      <div class="counter-icon">🛡️</div>
+      <div class="value" id="threat-counter-value">0</div>
+      <div class="label">Threats blocked <span style="color:#6b7280; font-weight:400;">(since first opened, this browser)</span></div>
+    </div>
+    <div class="globe-box">
+      <div id="globe-canvas"></div>
+      <div class="hint">recent blocked requests — origin is illustrative (hashed from IP), not real GeoIP</div>
+    </div>
   </div>
 
   <div class="charts">
@@ -126,6 +166,7 @@ const MAX_ROWS = 50;
 const DONUT_COLORS = ['#60a5fa', '#4ade80', '#f87171', '#facc15', '#a78bfa', '#fb923c', '#22d3ee', '#9aa0aa'];
 
 let events = []; // chronological, oldest first
+let pendingBlocked = []; // deny-event source IPs since the last 1s tick — drained by drainGlobeQueue()
 
 const filters = { ip: '', path: '', domain: '', decision: 'all' };
 
@@ -410,6 +451,7 @@ function renderCharts() {
 function tick() {
   renderTableAndStats();
   renderCharts();
+  drainGlobeQueue();
 }
 
 // addEvent must stay O(1): under real traffic this fires far more than once a
@@ -422,6 +464,205 @@ function addEvent(ev) {
   events.push(ev);
   if (events.length > MAX_BUFFER) events.shift();
   recordToBucket(ev);
+  if (ev.decision === 'deny') {
+    pendingBlocked.push(ev.ip);
+    bumpThreatCounter();
+  }
+}
+
+// ---- Threats-blocked counter + 3D "attack globe" ----------------------
+// Both are pure bling: the counter persists in localStorage so it reads as
+// a running total rather than resetting on every refresh, and the globe's
+// point placement is a deterministic hash of the source IP, not a real
+// GeoIP lookup — this project doesn't wire up third-party geolocation
+// APIs, so plotting stays honest by not claiming a location it doesn't
+// actually know. Same reason there's no arc-to-a-fake-HQ effect: that
+// would imply a real destination this data doesn't have either.
+
+let totalBlocked = parseInt(localStorage.getItem('totalBlockedEver') || '0', 10) || 0;
+
+function bumpThreatCounter() {
+  totalBlocked++;
+  try { localStorage.setItem('totalBlockedEver', String(totalBlocked)); } catch (e) { /* private browsing etc. — just don't persist */ }
+  const el = document.getElementById('threat-counter-value');
+  el.textContent = totalBlocked.toLocaleString();
+  el.classList.remove('flash');
+  void el.offsetWidth; // force reflow so re-adding the class restarts the animation even mid-burst
+  el.classList.add('flash');
+}
+
+function hashToLatLon(ip) {
+  let h1 = 2166136261, h2 = 0x9e3779b9;
+  for (let i = 0; i < ip.length; i++) {
+    const c = ip.charCodeAt(i);
+    h1 = (h1 ^ c) * 16777619 >>> 0;
+    h2 = ((h2 << 5) - h2 + c) >>> 0;
+  }
+  const lat = (h1 % 17000) / 100 - 85; // -85..85 — avoid the poles, purely for a less cluttered look
+  const lon = (h2 % 36000) / 100 - 180; // -180..180
+  return [lat, lon];
+}
+
+const GLOBE_RADIUS = 3;
+const GLOBE_MARKER_TTL_MS = 60000; // same 60s "recent activity" window the trend charts use
+const GLOBE_MAX_PULSES_PER_TICK = 12; // caps new-geometry cost per tick under a burst; marker recency still updates for every event regardless
+
+let globeScene, globeCamera, globeRenderer, globeGroup;
+const globeMarkers = new Map(); // ip -> { mesh, lastSeen }
+const globePulses = []; // { mesh, start }
+
+function latLonToVec3(lat, lon, radius) {
+  const phi = (90 - lat) * Math.PI / 180;
+  const theta = (lon + 180) * Math.PI / 180;
+  return new THREE.Vector3(
+    -radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.sin(theta)
+  );
+}
+
+function spawnGlobePulse(lat, lon, color) {
+  const pos = latLonToVec3(lat, lon, GLOBE_RADIUS);
+  // AdditiveBlending + depthWrite:false is what makes this read as a glowing
+  // scanner ping rather than a flat colored disc — it brightens whatever's
+  // behind it instead of just painting over it.
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.03, 0.09, 24),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false })
+  );
+  ring.position.copy(pos);
+  ring.lookAt(pos.clone().multiplyScalar(2));
+  globeGroup.add(ring);
+  globePulses.push({ mesh: ring, start: performance.now() });
+}
+
+// Two meshes per marker: a small solid core (so it stays visible as a
+// distinct dot even at 100% opacity) plus a larger additive-blended halo
+// behind it — a plain 0.045-radius sphere against a 3-unit globe read as an
+// almost invisible speck in testing, the halo is what actually makes it
+// pop against the wireframe.
+function upsertGlobeMarker(ip, lat, lon, color) {
+  let m = globeMarkers.get(ip);
+  if (!m) {
+    const pos = latLonToVec3(lat, lon, GLOBE_RADIUS * 1.01);
+    const core = new THREE.Mesh(
+      new THREE.SphereGeometry(0.06, 8, 8),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1 })
+    );
+    const halo = new THREE.Mesh(
+      new THREE.SphereGeometry(0.17, 8, 8),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false })
+    );
+    core.position.copy(pos);
+    halo.position.copy(pos);
+    globeGroup.add(core);
+    globeGroup.add(halo);
+    m = { mesh: core, halo };
+    globeMarkers.set(ip, m);
+  }
+  m.lastSeen = performance.now();
+}
+
+function pruneGlobeMarkers(now) {
+  for (const [ip, m] of globeMarkers) {
+    const age = now - m.lastSeen;
+    if (age > GLOBE_MARKER_TTL_MS) {
+      globeGroup.remove(m.mesh); m.mesh.geometry.dispose(); m.mesh.material.dispose();
+      globeGroup.remove(m.halo); m.halo.geometry.dispose(); m.halo.material.dispose();
+      globeMarkers.delete(ip);
+    } else {
+      const fade = 1 - age / GLOBE_MARKER_TTL_MS;
+      m.mesh.material.opacity = fade;
+      m.halo.material.opacity = 0.45 * fade;
+    }
+  }
+}
+
+function updateGlobePulses(now) {
+  for (let i = globePulses.length - 1; i >= 0; i--) {
+    const p = globePulses[i];
+    const t = (now - p.start) / 900; // ~0.9s expanding-ring lifespan
+    if (t >= 1) {
+      globeGroup.remove(p.mesh);
+      p.mesh.geometry.dispose(); p.mesh.material.dispose();
+      globePulses.splice(i, 1);
+      continue;
+    }
+    const scale = 1 + t * 14;
+    p.mesh.scale.set(scale, scale, scale);
+    p.mesh.material.opacity = 0.95 * (1 - t);
+  }
+}
+
+// Drained once per 1s tick, not per event — same reasoning as the chart
+// redraws: under a fast burst this keeps new-mesh creation bounded
+// (GLOBE_MAX_PULSES_PER_TICK) while every event still refreshes its
+// marker's recency so nothing fades out prematurely just because it lost
+// the pulse-ring lottery that tick.
+function drainGlobeQueue() {
+  if (!pendingBlocked.length || !globeGroup) { pendingBlocked = []; return; }
+  const batch = pendingBlocked;
+  pendingBlocked = [];
+  let spawned = 0;
+  for (const ip of batch) {
+    const [lat, lon] = hashToLatLon(ip);
+    upsertGlobeMarker(ip, lat, lon, 0xf87171);
+    if (spawned < GLOBE_MAX_PULSES_PER_TICK) { spawnGlobePulse(lat, lon, 0xf87171); spawned++; }
+  }
+}
+
+function resizeGlobe() {
+  const container = document.getElementById('globe-canvas');
+  if (!container || !globeRenderer) return;
+  const w = container.clientWidth, h = container.clientHeight;
+  if (!w || !h) return;
+  globeCamera.aspect = w / h;
+  globeCamera.updateProjectionMatrix();
+  globeRenderer.setSize(w, h);
+}
+
+function animateGlobe() {
+  requestAnimationFrame(animateGlobe);
+  const now = performance.now();
+  globeGroup.rotation.y += 0.0015;
+  pruneGlobeMarkers(now);
+  updateGlobePulses(now);
+  globeRenderer.render(globeScene, globeCamera);
+}
+
+// A dotted/wireframe "cyber globe" rather than a textured earth sphere —
+// no texture asset to bundle or fetch, fits the theme, and looks
+// deliberately synthetic rather than implying real satellite imagery.
+function initGlobe() {
+  const container = document.getElementById('globe-canvas');
+  const w = container.clientWidth || 300, h = container.clientHeight || 260;
+
+  globeScene = new THREE.Scene();
+  globeCamera = new THREE.PerspectiveCamera(45, w / h, 0.1, 100);
+  globeCamera.position.set(0, 0, 8);
+  globeRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  globeRenderer.setSize(w, h);
+  globeRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  container.appendChild(globeRenderer.domElement);
+
+  globeGroup = new THREE.Group();
+  globeScene.add(globeGroup);
+
+  globeGroup.add(new THREE.Mesh(
+    new THREE.SphereGeometry(GLOBE_RADIUS, 24, 18),
+    new THREE.MeshBasicMaterial({ color: 0x3b82f6, wireframe: true, transparent: true, opacity: 0.25 })
+  ));
+  globeGroup.add(new THREE.Mesh(
+    new THREE.SphereGeometry(GLOBE_RADIUS * 0.985, 32, 24),
+    new THREE.MeshBasicMaterial({ color: 0x0a1220, transparent: true, opacity: 0.85 })
+  ));
+  globeGroup.add(new THREE.Mesh(
+    new THREE.SphereGeometry(GLOBE_RADIUS * 1.12, 32, 24),
+    new THREE.MeshBasicMaterial({ color: 0x60a5fa, transparent: true, opacity: 0.06, side: THREE.BackSide })
+  ));
+
+  window.addEventListener('resize', resizeGlobe);
+  animateGlobe();
 }
 
 setInterval(tick, 1000);
@@ -715,6 +956,8 @@ async function pollGeneratedExclusionsCount() {
 pollGeneratedExclusionsCount();
 setInterval(pollGeneratedExclusionsCount, 10000);
 
+document.getElementById('threat-counter-value').textContent = totalBlocked.toLocaleString();
+initGlobe();
 connect();
 tick();
 </script>

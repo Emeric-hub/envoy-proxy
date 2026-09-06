@@ -8,6 +8,19 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **Dashboard "bling": a live 3D attack globe + an animated threats-blocked
+  counter.** A rotating wireframe globe (three.js, no texture asset — a
+  procedural dotted/wireframe sphere fits the theme and needs nothing
+  bundled or fetched) plots a glowing marker for every denied request's
+  source IP, fed by the same WebSocket stream the table/charts already use.
+  Placement is a deterministic hash of the IP, not real GeoIP — this
+  project doesn't wire up a third-party geolocation API, so the globe
+  stays honest about not actually knowing where an IP is (labeled as such
+  in the UI). New pulses/markers are drained once per 1s tick rather than
+  per event, same reasoning as the existing chart redraws, so a fast burst
+  can't spam new WebGL geometry. The counter persists in `localStorage` so
+  it reads as a running total rather than resetting on refresh.
+
 - **`letsencrypt-sidecar`: opt-in automatic TLS via Let's Encrypt.** A new
   `routes.csv` column (`letsencrypt`) flags a domain for real
   issuance/renewal instead of `generate-cert.sh`'s self-signed flow —
