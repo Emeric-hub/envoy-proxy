@@ -197,17 +197,21 @@ more real than a laptop demo:
   resolvable, so real issuance can never succeed here by design — see
   `letsencrypt-sidecar/README.md` for what *was* verified (the whole
   chain up to that boundary, against Let's Encrypt's real staging API).
-- **`geoip-service` was never tested against a real MaxMind database** —
-  no license key was available to verify actual download/extraction/lookup
-  against real data in this environment. What *was* verified: the full
-  plumbing with no credentials configured (fails soft — `/health` reports
-  `configured: false`, every lookup returns `found: false`, scoring-service
-  degrades exactly the same way as any other disabled signal) and with the
-  "geoip" profile running but still uncredentialed (health-check
-  connectivity works, per-request enrichment call succeeds, event carries
-  `geo_found: false`). Get a MaxMind account + license key before trusting
-  the download/extraction path (tar.gz parsing, Basic Auth, atomic
-  rename) against the real API.
+- ~~`geoip-service` was never tested against a real MaxMind database~~ —
+  **verified against a real account.** One gotcha hit live: a freshly
+  created MaxMind account/license key can 401 for a few minutes before it
+  finishes activating on MaxMind's side (`download failed: HTTP 401: Your
+  account ID or license key could not be authenticated` — real API
+  response, not a bug here) — geoip-service's own first attempt is
+  immediate at container start, so it can lose that race on a brand-new
+  account. It doesn't retry until `GEOIP_REFRESH_INTERVAL_H` (default 24h)
+  later; a manual `docker compose restart geoip-service` once the account's
+  actually active resolves it immediately rather than waiting. After that,
+  confirmed live end-to-end: real download + extraction + load
+  (`/health`: `configured: true, loaded: true`), a real lookup
+  (`8.8.8.8` → `US`, real lat/lon), and the full request pipeline
+  publishing `geo_found: true` with real coordinates on the risk-event
+  stream.
 - **HTTP/3 (QUIC)** is wired up (UDP listener bound, `alt-svc` advertised,
   Envoy accepts the config) but hasn't been exercised with a real QUIC
   handshake — the `curl` available in dev here isn't built with HTTP/3

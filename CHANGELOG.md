@@ -23,7 +23,15 @@ compress a lot of iteration into each entry.
   deterministic IP-hash placement otherwise — same fallback whether GeoIP
   is disabled, unreachable, or simply has no entry for a private/reserved
   IP. New `geoip` pill + live-connectivity dot in the config bar, matching
-  the existing coraza/crowdsec/ai-tuner pattern.
+  the existing coraza/crowdsec/ai-tuner pattern. Verified end-to-end
+  against a real MaxMind account: real download/extraction/load, a real
+  lookup (`8.8.8.8` → `US`, real lat/lon), and `geo_found: true` with real
+  coordinates on the risk-event stream for a live request. One real gotcha
+  hit along the way, now documented in TODO.md: a freshly created MaxMind
+  license key can 401 for a few minutes before MaxMind finishes activating
+  it, and geoip-service's own first attempt is immediate at container
+  start — it doesn't retry until `GEOIP_REFRESH_INTERVAL_H` later, so a
+  manual restart once the account's active resolves it immediately.
 
 - **Real-time traffic highlight on the "front domain → backend target"
   topology diagram.** Each request briefly flashes the domain chip, the
