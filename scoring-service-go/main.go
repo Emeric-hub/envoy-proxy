@@ -16,6 +16,7 @@ import (
 	"scoring-service-go/authz"
 	"scoring-service-go/coraza"
 	"scoring-service-go/crowdsec"
+	"scoring-service-go/geoip"
 	"scoring-service-go/health"
 )
 
@@ -29,6 +30,7 @@ func main() {
 	// their own failure, just keep retrying (see their own doc comments).
 	go coraza.PollHealth()
 	go crowdsec.PollDecisionsStream()
+	go geoip.PollHealth()
 
 	errCh := make(chan error, 2)
 

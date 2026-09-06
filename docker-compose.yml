@@ -105,6 +105,30 @@ services:
     expose:
       - "8090"
 
+  # Opt-in, off by default (COMPOSE_PROFILES) — enriches the dashboard's
+  # attack globe with real (approximate) IP locations instead of the
+  # deterministic hash-based placeholder. Requires a free MaxMind account +
+  # license key (see geoip-service/main.go's doc comment); get your
+  # organization's sign-off for the third-party account before setting
+  # these for real, same class of prerequisite as letsencrypt-sidecar
+  # needing a real, owned domain.
+  geoip-service:
+    profiles: ["geoip"]
+    build: ./geoip-service
+    environment:
+      - GEOIP_ACCOUNT_ID=${GEOIP_ACCOUNT_ID:-}
+      - GEOIP_LICENSE_KEY=${GEOIP_LICENSE_KEY:-}
+      - GEOIP_EDITION=${GEOIP_EDITION:-GeoLite2-City}
+      - GEOIP_DB_PATH=/data/GeoLite2-City.mmdb
+      - GEOIP_REFRESH_INTERVAL_H=${GEOIP_REFRESH_INTERVAL_H:-24}
+      - GEOIP_LISTEN_ADDR=:8092
+    volumes:
+      # Persistent — same reasoning as letsencrypt-data: the downloaded
+      # database survives restarts instead of re-fetching on every one.
+      - geoip-data:/data
+    expose:
+      - "8092"
+
   scoring-service:
     build: ./scoring-service-go
     environment:
@@ -120,6 +144,11 @@ services:
       - CROWDSEC_URL=http://crowdsec:8080
       - CROWDSEC_API_KEY=${CROWDSEC_BOUNCER_KEY:-devbouncerkeychangeme}
       - CROWDSEC_POLL_INTERVAL=${CROWDSEC_POLL_INTERVAL:-10}
+      # Off by default — see geoip-service's profile note below. Cosmetic
+      # enrichment only (dashboard globe), never a scoring input.
+      - ENABLE_GEOIP=${ENABLE_GEOIP:-false}
+      - GEOIP_URL=http://geoip-service:8092/lookup
+      - GEOIP_HEALTH_URL=http://geoip-service:8092/health
     volumes:
       - ./crowdsec/feed:/var/log/crowdsec-feed
     expose:
@@ -128,16 +157,20 @@ services:
     depends_on:
       redis:
         condition: service_started
-      # required: false — coraza-service/crowdsec are profile-gated (see
-      # COMPOSE_PROFILES in .env) and may not be running at all. main.go
-      # already handles either one being unreachable the same way it handles
-      # ENABLE_CORAZA/ENABLE_CROWDSEC=false: skip that signal, fall back to
-      # the rest. Without required:false, compose refuses to start this
-      # service at all when a profile is disabled.
+      # required: false — coraza-service/crowdsec/geoip-service are all
+      # profile-gated (see COMPOSE_PROFILES in .env) and may not be running
+      # at all. main.go already handles any of them being unreachable the
+      # same way it handles ENABLE_CORAZA/ENABLE_CROWDSEC/ENABLE_GEOIP=false:
+      # skip that signal, fall back to the rest. Without required:false,
+      # compose refuses to start this service at all when a profile is
+      # disabled.
       coraza-service:
         condition: service_started
         required: false
       crowdsec:
+        condition: service_started
+        required: false
+      geoip-service:
         condition: service_started
         required: false
 
@@ -311,6 +344,7 @@ services:
       - ENABLE_CORAZA=${ENABLE_CORAZA:-true}
       - ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-true}
       - ENABLE_AI_TUNER=${ENABLE_AI_TUNER:-true}
+      - ENABLE_GEOIP=${ENABLE_GEOIP:-false}
       # For the live ai-tuner/ollama connectivity check — same source as
       # crs-tuner's own OLLAMA_URL/OLLAMA_API_KEY. The key is only ever used
       # server-side for that check, never sent to the browser — only whether
@@ -362,6 +396,7 @@ volumes:
   crowdsec-data:
   ollama-data:
   letsencrypt-data:
+  geoip-data:
   # Created by claude-shim/setup-credentials.sh, not by compose (external:
   # true) — compose defaults to project-prefixing volume names (would
   # otherwise be "envoy_claude-shim-creds"), which that script has no way

@@ -197,6 +197,17 @@ more real than a laptop demo:
   resolvable, so real issuance can never succeed here by design — see
   `letsencrypt-sidecar/README.md` for what *was* verified (the whole
   chain up to that boundary, against Let's Encrypt's real staging API).
+- **`geoip-service` was never tested against a real MaxMind database** —
+  no license key was available to verify actual download/extraction/lookup
+  against real data in this environment. What *was* verified: the full
+  plumbing with no credentials configured (fails soft — `/health` reports
+  `configured: false`, every lookup returns `found: false`, scoring-service
+  degrades exactly the same way as any other disabled signal) and with the
+  "geoip" profile running but still uncredentialed (health-check
+  connectivity works, per-request enrichment call succeeds, event carries
+  `geo_found: false`). Get a MaxMind account + license key before trusting
+  the download/extraction path (tar.gz parsing, Basic Auth, atomic
+  rename) against the real API.
 - **HTTP/3 (QUIC)** is wired up (UDP listener bound, `alt-svc` advertised,
   Envoy accepts the config) but hasn't been exercised with a real QUIC
   handshake — the `curl` available in dev here isn't built with HTTP/3

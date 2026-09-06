@@ -12,6 +12,7 @@ import (
 	"scoring-service-go/coraza"
 	"scoring-service-go/crowdsec"
 	"scoring-service-go/events"
+	"scoring-service-go/geoip"
 	"scoring-service-go/scoring"
 )
 
@@ -78,6 +79,13 @@ func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		httpStatus = 403
 	}
 	reasons := scoring.BuildReasons(signals, matchedRules, crowdsecDecisions)
+	// Cosmetic enrichment only (dashboard globe), not a scoring input — see
+	// geoip package doc comment. Still a synchronous call like coraza/crowdsec
+	// above (same short-timeout, fail-soft shape), so it can add up to
+	// GEOIP_TIMEOUT to the response — same accepted trade-off as those,
+	// and a no-op (immediate zero-value return) whenever ENABLE_GEOIP is
+	// false, the default.
+	geo := geoip.Lookup(clientIP)
 	durationMS := float64(time.Since(started)) / float64(time.Millisecond)
 
 	crowdsec.LogRequest(clientIP, method, path, httpStatus, userAgent)
@@ -101,6 +109,11 @@ func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		CrowdsecDecisions: crowdsecDecisions,
 		Reasons:           reasons,
 		DurationMS:        durationMS,
+		GeoFound:          geo.Found,
+		CountryCode:       geo.CountryCode,
+		City:              geo.City,
+		Lat:               geo.Lat,
+		Lon:               geo.Lon,
 	})
 
 	if blocked {

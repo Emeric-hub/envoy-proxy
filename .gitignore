@@ -30,3 +30,6 @@ tests/ssl-audit/reports/*
 coraza-service/crs-exclusions/auto-*.conf
 crs-tuner/analysis/*
 !crs-tuner/analysis/.gitkeep
+
+# Python bytecode cache.
+__pycache__/

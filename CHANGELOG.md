@@ -8,6 +8,23 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **`geoip-service`: opt-in local GeoIP lookups enriching the dashboard's
+  attack globe with real locations.** A new Go service (profile `geoip`,
+  off by default) that downloads and periodically refreshes a MaxMind
+  GeoLite2-City database (needs a free MaxMind account + license key —
+  genuinely a third-party data dependency, not a bundled asset, since it
+  re-fetches on a schedule to stay current) and serves local `/lookup`
+  queries — no per-request call to MaxMind itself. `scoring-service` calls
+  it (new `ENABLE_GEOIP`, default `false`) after the actual allow/deny
+  decision is made — cosmetic enrichment only, never a scoring input — and
+  publishes `geo_found`/`country_code`/`city`/`lat`/`lon` on the existing
+  risk-event stream. The dashboard globe (added earlier this session) now
+  plots real coordinates when available, falling back to the same
+  deterministic IP-hash placement otherwise — same fallback whether GeoIP
+  is disabled, unreachable, or simply has no entry for a private/reserved
+  IP. New `geoip` pill + live-connectivity dot in the config bar, matching
+  the existing coraza/crowdsec/ai-tuner pattern.
+
 - **Real-time traffic highlight on the "front domain → backend target"
   topology diagram.** Each request briefly flashes the domain chip, the
   target chip, and the connecting curve it actually took, plus a dot that

@@ -120,7 +120,7 @@
     </div>
     <div class="globe-box">
       <div id="globe-canvas"></div>
-      <div class="hint">recent blocked requests — origin is illustrative (hashed from IP), not real GeoIP</div>
+      <div class="hint">recent blocked requests — real GeoIP when geoip-service resolves the IP, an illustrative IP-hash placement otherwise</div>
     </div>
   </div>
 
@@ -476,7 +476,7 @@ function addEvent(ev) {
   if (events.length > MAX_BUFFER) events.shift();
   recordToBucket(ev);
   if (ev.decision === 'deny') {
-    pendingBlocked.push(ev.ip);
+    pendingBlocked.push({ ip: ev.ip, geoFound: !!ev.geo_found, lat: ev.lat, lon: ev.lon });
     bumpThreatCounter();
   }
   pendingTopologyFlashes.push({ domain: ev.domain, decision: ev.decision });
@@ -553,13 +553,16 @@ function flashTopologyLink(domain, color) {
 }
 
 // ---- Threats-blocked counter + 3D "attack globe" ----------------------
-// Both are pure bling: the counter persists in localStorage so it reads as
-// a running total rather than resetting on every refresh, and the globe's
-// point placement is a deterministic hash of the source IP, not a real
-// GeoIP lookup — this project doesn't wire up third-party geolocation
-// APIs, so plotting stays honest by not claiming a location it doesn't
-// actually know. Same reason there's no arc-to-a-fake-HQ effect: that
-// would imply a real destination this data doesn't have either.
+// The counter is pure bling: persists in localStorage so it reads as a
+// running total rather than resetting on every refresh. The globe's point
+// placement is real GeoIP (country/city/lat/lon) whenever scoring-service
+// resolved one via the opt-in geoip-service — see markerLatLon() — and
+// falls back to a deterministic hash of the source IP otherwise (geoip
+// disabled, unreachable, or a private/reserved IP GeoLite2 has no entry
+// for), so plotting never silently claims a location it doesn't actually
+// have. Still no arc-to-a-fake-HQ effect: real GeoIP has no "destination"
+// to draw one to, and it'd be misleading for the hash-fallback case
+// either way.
 
 let totalBlocked = parseInt(localStorage.getItem('totalBlockedEver') || '0', 10) || 0;
 
@@ -583,6 +586,14 @@ function hashToLatLon(ip) {
   const lat = (h1 % 17000) / 100 - 85; // -85..85 — avoid the poles, purely for a less cluttered look
   const lon = (h2 % 36000) / 100 - 180; // -180..180
   return [lat, lon];
+}
+
+// Real GeoIP when scoring-service actually resolved one (ENABLE_GEOIP on,
+// geoip-service reachable, IP not in a private/reserved range) — the hash
+// fallback otherwise, same as when geoip-service isn't running at all.
+function markerLatLon(entry) {
+  if (entry.geoFound && typeof entry.lat === 'number' && typeof entry.lon === 'number') return [entry.lat, entry.lon];
+  return hashToLatLon(entry.ip);
 }
 
 const GLOBE_RADIUS = 3;
@@ -686,9 +697,9 @@ function drainGlobeQueue() {
   const batch = pendingBlocked;
   pendingBlocked = [];
   let spawned = 0;
-  for (const ip of batch) {
-    const [lat, lon] = hashToLatLon(ip);
-    upsertGlobeMarker(ip, lat, lon, 0xf87171);
+  for (const entry of batch) {
+    const [lat, lon] = markerLatLon(entry);
+    upsertGlobeMarker(entry.ip, lat, lon, 0xf87171);
     if (spawned < GLOBE_MAX_PULSES_PER_TICK) { spawnGlobePulse(lat, lon, 0xf87171); spawned++; }
   }
 }
@@ -783,6 +794,7 @@ function renderConfigBar() {
     <span class="pill">coraza / CRS: ${onOff(cfg.enable_coraza)} <span id="coraza-live-dot" class="live-dot unknown" title="checking..."></span> <span style="color:#6b7280">(v${cfg.crs_version || '?'}, PL${cfg.crs_paranoia_level || '?'}, fetched ${(cfg.crs_fetched_at || 'unknown').split('T')[0]})</span></span>
     <span class="pill">crowdsec: ${onOff(cfg.enable_crowdsec)} <span id="crowdsec-live-dot" class="live-dot unknown" title="checking..."></span></span>
     <span class="pill">ai-tuner / ollama: ${onOff(cfg.enable_ai_tuner)} <span id="ollama-live-dot" class="live-dot unknown" title="checking..."></span> ${cfg.ollama_auth_configured ? '<span style="color:#6b7280" title="Authorization header sent to Ollama (OLLAMA_API_KEY set)">🔒 auth</span>' : ''}</span>
+    <span class="pill">geoip: ${onOff(cfg.enable_geoip)} <span id="geoip-live-dot" class="live-dot unknown" title="checking..."></span></span>
   `;
 }
 renderConfigBar();
@@ -811,11 +823,14 @@ async function pollLiveStatus() {
     const data = await res.json();
     applyLiveDot('crowdsec-live-dot', data.crowdsec, 'crowdsec disabled');
     applyLiveDot('coraza-live-dot', data.coraza, 'coraza disabled');
+    applyLiveDot('geoip-live-dot', data.geoip, 'geoip disabled');
   } catch (e) {
     applyLiveDot('crowdsec-live-dot', null, '');
     applyLiveDot('coraza-live-dot', null, '');
+    applyLiveDot('geoip-live-dot', null, '');
     document.getElementById('crowdsec-live-dot').title = 'dashboard could not reach its own /api/status';
     document.getElementById('coraza-live-dot').title = 'dashboard could not reach its own /api/status';
+    document.getElementById('geoip-live-dot').title = 'dashboard could not reach its own /api/status';
   }
   try {
     const res = await fetch('/api/ollama-status');

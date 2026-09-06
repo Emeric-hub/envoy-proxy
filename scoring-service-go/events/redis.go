@@ -121,6 +121,16 @@ type DecisionEvent struct {
 	CrowdsecDecisions []scoring.CrowdsecDecision `json:"crowdsec_decisions"`
 	Reasons           []string                   `json:"reasons"`
 	DurationMS        float64                    `json:"duration_ms"`
+	// Geo* fields are only meaningful when GeoFound is true — ENABLE_GEOIP
+	// off, geoip-service unreachable, or a private/reserved IP all leave
+	// these zero-valued, indistinguishable from each other by design (see
+	// geoip.Result's doc comment). The dashboard falls back to a
+	// deterministic hash-based globe placement whenever GeoFound is false.
+	GeoFound    bool    `json:"geo_found"`
+	CountryCode string  `json:"country_code,omitempty"`
+	City        string  `json:"city,omitempty"`
+	Lat         float64 `json:"lat,omitempty"`
+	Lon         float64 `json:"lon,omitempty"`
 }
 
 // PublishDecision is fire-and-forget: a slow/unreachable Redis must never

@@ -9,6 +9,7 @@ import (
 
 	"scoring-service-go/coraza"
 	"scoring-service-go/crowdsec"
+	"scoring-service-go/geoip"
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
@@ -16,5 +17,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"crowdsec": crowdsec.Status(),
 		"coraza":   coraza.Status(),
+		"geoip":    geoip.Status(),
 	})
 }

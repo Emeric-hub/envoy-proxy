@@ -54,6 +54,7 @@ STATIC_CONFIG = {
     "enable_coraza": _bool_env("ENABLE_CORAZA", "true"),
     "enable_crowdsec": _bool_env("ENABLE_CROWDSEC", "true"),
     "enable_ai_tuner": _bool_env("ENABLE_AI_TUNER", "true"),
+    "enable_geoip": _bool_env("ENABLE_GEOIP", "false"),
     "ollama_auth_configured": bool(OLLAMA_API_KEY),
 }
 
