@@ -292,6 +292,17 @@ traffic against the stack or verifies/scores an outcome lives in `tests/`.
   `AUDIT_MODE`/`RISK_THRESHOLD`/`ENABLE_CORAZA`/`ENABLE_CROWDSEC`/
   `ENABLE_AI_TUNER`/`CRS_PARANOIA_LEVEL` in `.env`, restart the affected
   service, and re-run to see exactly what changed.
+- `tests/perf-impact-test.sh [vus] [ramp] [hold]` — the *performance* cost
+  version of the same idea: runs the k6 smoke test with every signal off,
+  then re-runs it with Coraza, then +CrowdSec, then +GeoIP, then +ai-tuner
+  each layered on top, holding load identical across runs, and prints a
+  p95/p99 latency comparison table (the delta between consecutive rows is
+  that signal's own added cost). Skips a step gracefully (with a warning)
+  if its container isn't running; always restores `scoring-service` to the
+  real `.env` configuration on exit, even if interrupted. Needs a decent
+  VU count/duration to say anything meaningful — the defaults (20/10s/20s)
+  are a reasonable floor; noisy/inconsistent-looking deltas usually just
+  mean the run was too short, not a real regression.
 
 All `tests/*.sh` scripts are run from the project root (`./tests/<script>.sh`),
 not from inside `tests/`.

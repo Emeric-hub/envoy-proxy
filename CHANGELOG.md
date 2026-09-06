@@ -8,6 +8,21 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **`tests/perf-impact-test.sh`: measures the real latency cost of each
+  security signal.** Runs the existing k6 smoke test (`tests/loadtest/smoke.js`)
+  five times against identical load — signals off, +Coraza, +CrowdSec,
+  +GeoIP, +ai-tuner, each cumulative — recreating `scoring-service` with
+  the right `ENABLE_*` combination between runs, and prints a p95/p99
+  comparison table so the delta between consecutive rows is that signal's
+  own added cost. A real cold-start bias was found and fixed along the
+  way: the very first run after a fresh container recreate pays a
+  one-time connection/DNS-priming cost unrelated to the signal being
+  measured, which skewed whichever step ran first — a discarded warm-up
+  burst before each step's real measurement fixes it. Skips a step (with a
+  warning) if its container isn't running rather than measuring an
+  unreachable-service timeout as if it were the signal's real cost; always
+  restores `scoring-service` to the real `.env` configuration on exit.
+
 - **A second backend (`backend2`) and three more `routes.csv` domains**
   (`blog.example.com`, `store.example.com` → `backend2`; `test.example.com`
   → the original `backend`) — test scaffolding for multi-backend routing
