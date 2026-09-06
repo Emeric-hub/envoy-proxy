@@ -6,13 +6,57 @@ compress a lot of iteration into each entry.
 
 ## [Unreleased]
 
+### Added
+
+- **Hover tooltips on attack-map markers**, and a progressively "drawn"
+  line instead of the arc appearing all at once. Hovering a marker (an
+  attacker, the server, or the private-IP point) shows its IP, resolved
+  location (or "private/internal" / "unknown"), how many requests it's
+  been blocked for, its most recent domain, and how long ago — delegated
+  on the whole SVG via `data-ip` attributes rather than per-marker
+  listeners, since markers come and go constantly. The arc now animates
+  via stroke-dasharray/dashoffset (the standard SVG line-draw technique)
+  instead of appearing instantly, timed to finish exactly as the existing
+  traveling dot reaches the server. Took two attempts to get the drawing
+  effect actually working: a CSS `transition`-based version (the more
+  common approach) verified live to silently complete instantly instead
+  of animating on this specific page, even with the standard
+  forced-reflow-then-double-rAF fix for that class of bug — switched to
+  the Web Animations API (`element.animate()`, one atomic call, no
+  separate "commit the starting value" step to get wrong) and verified
+  that one actually progresses smoothly frame-by-frame.
+
+### Fixed
+
+- **Attack map: the lat/lon-to-pixel projection was genuinely wrong.**
+  User-reported: a France-located server rendered up near Denmark. The
+  original formula assumed the embedded map's viewBox linearly spans the
+  full ±90° latitude / ±180° longitude range — reasonable-looking on a
+  handful of widely-spaced cities eyeballed on a small image (the
+  "verification" done when the map first shipped), but wrong: the
+  vertical scale undershoots substantially, since the map doesn't
+  actually extend all the way to the poles within that viewBox the way
+  the horizontal axis extends to a full ±180° of longitude. Refit using
+  objective ground truth instead of eyeballing: extracted 14 countries'
+  own centroids directly from the embedded SVG's path data (a proper
+  path-command parser respecting relative vs. absolute coordinates, not
+  a naive "average every number," which silently produces garbage for
+  paths using lowercase/relative commands — this map's do) and fit
+  against their real-world lat/lon centroids. Verified live: the France
+  server marker now lands within a few pixels of the actual French
+  landmass, matching the ground-truth centroid extracted from the map's
+  own data.
+
 ### Changed
 
 - **Attack map: private/loopback source IPs, a legend, and zoom/pan.**
   Private/loopback IPs (RFC1918, `127.0.0.0/8`, link-local, `::1`) now
-  collapse onto one fixed, distinctly colored "Null Island" (0°N 0°E — the
-  conventional GIS placeholder, not a guess) marker instead of scattering
-  across the map via the IP-hash fallback, which would otherwise
+  collapse onto one fixed, distinctly colored marker in open Pacific
+  water — deliberately not "Null Island" (0°N 0°E), the conventional GIS
+  placeholder: technically correct, but close enough to the real African
+  coastline on this map to read as an actual location at a glance —
+  instead of scattering across the map via the IP-hash fallback, which
+  would otherwise
   misleadingly suggest a real external origin for what's structurally
   never one (e.g. the Docker bridge gateway, the source for most local
   demo testing). A small legend (server / attacker / private-internal-IP)

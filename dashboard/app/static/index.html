@@ -95,6 +95,13 @@
     display: inline-block; width: 7px; height: 7px; border-radius: 50%;
     margin-right: 0.35rem; vertical-align: middle;
   }
+  .map-tooltip {
+    position: absolute; z-index: 5; background: #1a1d24; border: 1px solid #2a2f3a;
+    border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.72rem; color: #e6e6e6;
+    pointer-events: none; white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  }
+  .map-tooltip .ip { font-family: ui-monospace, monospace; font-weight: 600; }
+  .map-tooltip .meta { color: #9aa0aa; margin-top: 0.15rem; }
   /* World-map borders/marker rings keep a constant on-screen stroke width
      regardless of zoom (vector-effect="non-scaling-stroke", set inline on
      those elements) — a plain scaled stroke goes from crisp to smeared as
@@ -545,6 +552,7 @@
         <span><i class="dot" style="background:#9ca3af"></i>private/internal IP</span>
       </div>
       <div class="hint">recent blocked requests — real GeoIP when geoip-service resolves the IP, an illustrative IP-hash placement otherwise</div>
+      <div id="map-tooltip" class="map-tooltip" hidden></div>
     </div>
   </div>
 
@@ -900,7 +908,7 @@ function addEvent(ev) {
   if (events.length > MAX_BUFFER) events.shift();
   recordToBucket(ev);
   if (ev.decision === 'deny') {
-    pendingBlocked.push({ ip: ev.ip, geoFound: !!ev.geo_found, lat: ev.lat, lon: ev.lon });
+    pendingBlocked.push({ ip: ev.ip, geoFound: !!ev.geo_found, lat: ev.lat, lon: ev.lon, country: ev.country_code, city: ev.city, domain: ev.domain });
     bumpThreatCounter();
   }
   pendingTopologyFlashes.push({ domain: ev.domain, decision: ev.decision });
@@ -1036,12 +1044,15 @@ function isPrivateOrLoopbackIP(ip) {
   return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
 }
 
-// "Null Island" (0°N 0°E) — the conventional GIS placeholder for "no real
-// location," not a random guess. Every private/loopback IP collapses onto
-// this exact same point (not scattered like the hash fallback below),
-// which is the point: it should read as one deliberate "internal traffic"
-// marker, not as N distinct (fake) attacker locations.
-const NULL_ISLAND = [0, 0];
+// The conventional GIS "no real location" placeholder is Null Island
+// (0°N 0°E) — technically correct, but it sits close enough to the real
+// African coastline on this map to read as an actual location at a
+// glance. Open Pacific water, far from any coastline this low-res map
+// even renders, reads unambiguously as "nowhere real" instead. Every
+// private/loopback IP collapses onto this exact same point (not scattered
+// like the hash fallback below), which is the point: one deliberate
+// "internal traffic" marker, not N distinct (fake) attacker locations.
+const PRIVATE_IP_MARKER = [0, -160];
 
 const MAP_COLORS = { attack: '#f87171', private: '#9ca3af' };
 function markerCategory(ip) {
@@ -1055,25 +1066,47 @@ function markerCategory(ip) {
 // never resolve one for real, so entry.geoFound is always false for them
 // anyway, and they'd otherwise fall into the misleading hash fallback.
 function markerLatLon(entry) {
-  if (isPrivateOrLoopbackIP(entry.ip)) return NULL_ISLAND;
+  if (isPrivateOrLoopbackIP(entry.ip)) return PRIVATE_IP_MARKER;
   if (entry.geoFound && typeof entry.lat === 'number' && typeof entry.lon === 'number') return [entry.lat, entry.lon];
   return hashToLatLon(entry.ip);
 }
 
-// Calibrated against the embedded map's own viewBox (verified against
-// known city coordinates — London/New York/Tokyo/Sydney/Cairo/Rio/Cape
-// Town all land in the right place): plain linear equirectangular, no
-// further projection math needed. Doesn't handle the antimeridian
-// (lon ±180) specially — an attacker near +179° and a server near -179°
-// draws a line the "long way" around instead of wrapping, a cosmetic
-// edge case not worth the extra complexity here.
-const MAP_VB = { x: 30.767, y: 241.591, w: 784.077, h: 458.627 };
+// NOT a plain linear equirectangular map against its own viewBox — that
+// was the original assumption here, "verified" against a handful of
+// widely-spaced cities eyeballed on a small rendered image, and it was
+// wrong: a real user-reported bug (a France server rendering up near
+// Denmark) led to actually checking, and a naive full -90..90/-180..180
+// mapping onto the raw viewBox undershoots the real vertical scale
+// substantially — the map does not extend all the way to the poles
+// within that viewBox the way the horizontal axis extends to a full
+// ±180° of longitude.
+//
+// These coefficients are a linear least-squares fit (x = a·lon+b,
+// y = a·lat+b, fit separately) against 14 countries' own path data in
+// the embedded SVG (France, Germany, Spain, Italy, Egypt, South Africa,
+// Australia, Brazil, Japan, Canada, US, China, India, Russia) — each
+// country's centroid computed from its actual path coordinates (a
+// proper path-command parser respecting relative vs. absolute SVG path
+// commands, not a naive "average every number in the d attribute", which
+// silently produces garbage for any path using lowercase/relative
+// commands — this map's paths all do) against that country's real-world
+// lat/lon centroid. Residuals are small for compact, well-behaved
+// countries (Western Europe: ~10px on a ~784x458 canvas) and larger for
+// huge, irregularly-shaped ones (Russia, Canada, Brazil, Australia) where
+// a path-coordinate average centroid and a "commonly cited" geographic
+// centroid genuinely diverge — good enough for a cosmetic attack map, not
+// a claim of survey-grade accuracy. Doesn't handle the antimeridian
+// (lon ±180) specially either — an attacker near +179° and a server near
+// -179° draws a line the "long way" around instead of wrapping, a
+// cosmetic edge case not worth the extra complexity here.
 function projectLatLon(lat, lon) {
-  return [
-    MAP_VB.x + (lon + 180) / 360 * MAP_VB.w,
-    MAP_VB.y + (90 - lat) / 180 * MAP_VB.h,
-  ];
+  return [2.1598 * lon + 414.1030, -2.9597 * lat + 531.1063];
 }
+
+// The SVG's actual viewBox — a separate thing from the lat/lon fit above,
+// used only for zoom/pan math (converting on-screen pixel deltas to
+// viewBox units, and bounding how far the map can be panned).
+const MAP_VB = { x: 30.767, y: 241.591, w: 784.077, h: 458.627 };
 
 const MAP_MARKER_TTL_MS = 60000; // same 60s "recent activity" window the trend charts use
 const MAP_MAX_ARCS_PER_TICK = 20; // caps new-DOM-node cost per tick under a burst; marker recency still updates for every event regardless
@@ -1091,18 +1124,27 @@ function svgEl(tag, attrs) {
 // Two elements per marker, same reasoning as the old globe markers: a
 // small solid core (stays visible as a distinct dot) plus a larger, more
 // transparent halo behind it so it actually pops against the dark map
-// fill rather than reading as an almost-invisible speck.
-function upsertMapMarker(ip, lat, lon, color) {
+// fill rather than reading as an almost-invisible speck. Both carry
+// data-ip so the single delegated hover handler below (attachMapTooltip)
+// can look up which marker is under the cursor without per-element
+// listeners that would need cleanup when pruneMapMarkers removes one.
+function upsertMapMarker(entry, lat, lon, color, category) {
+  const ip = entry.ip;
   let m = mapMarkers.get(ip);
   if (!m) {
     const [x, y] = projectLatLon(lat, lon);
-    const halo = svgEl('circle', { cx: x, cy: y, r: 5, fill: color, opacity: 0.35 });
-    const core = svgEl('circle', { cx: x, cy: y, r: 2, fill: color, opacity: 1 });
+    const halo = svgEl('circle', { cx: x, cy: y, r: 5, fill: color, opacity: 0.35, 'data-ip': ip });
+    const core = svgEl('circle', { cx: x, cy: y, r: 2, fill: color, opacity: 1, 'data-ip': ip });
     document.getElementById('map-attack-layer').append(halo, core);
-    m = { core, halo };
+    m = { core, halo, count: 0, firstSeen: performance.now() };
     mapMarkers.set(ip, m);
   }
+  m.count++;
   m.lastSeen = performance.now();
+  m.category = category;
+  m.country = entry.country || null;
+  m.city = entry.city || null;
+  m.domain = entry.domain || null;
 }
 
 function pruneMapMarkers(now) {
@@ -1137,9 +1179,33 @@ function spawnAttackArc(lat, lon, color) {
   const d = `M${ax},${ay} Q${cx},${cy} ${sx},${sy}`;
 
   const layer = document.getElementById('map-attack-layer');
-  const arc = svgEl('path', { class: 'attack-arc', d, stroke: color, 'stroke-width': 1, opacity: 0.8 });
+  const arc = svgEl('path', { class: 'attack-arc', d, stroke: color, 'stroke-width': 1, opacity: 0.85, fill: 'none' });
   layer.appendChild(arc);
 
+  // "Drawn" progression rather than the whole line appearing at once:
+  // stroke-dasharray set to the path's own real length, stroke-dashoffset
+  // animated from that length down to 0 — the standard SVG line-draw
+  // technique. getTotalLength() needs the element already in the DOM with
+  // real path data, which it is by this point (appended just above).
+  //
+  // Web Animations API (element.animate()) rather than a CSS transition —
+  // tried that first (set the "from" dashoffset, force a reflow, change to
+  // "to" on the next frame) and verified live that it silently completed
+  // instantly instead of animating on this specific page, even with a
+  // double-rAF trigger. animate() takes both keyframes in one atomic call
+  // with no separate "commit the starting value first" step to get wrong,
+  // and was verified live (getComputedStyle sampled every 100ms) to
+  // actually progress smoothly where the transition approach didn't.
+  const len2 = arc.getTotalLength();
+  arc.style.strokeDasharray = len2;
+  arc.animate(
+    [{ strokeDashoffset: len2 }, { strokeDashoffset: 0 }],
+    { duration: 900, easing: 'linear', fill: 'forwards' }
+  );
+
+  // Traveling dot at the line's leading edge — same duration as the draw
+  // animation above so it reaches the server exactly as the line finishes
+  // drawing, not before or after.
   const dot = svgEl('circle', { r: 2.2, fill: '#facc15' });
   const anim = svgEl('animateMotion', { dur: '0.9s', repeatCount: '1', path: d });
   dot.appendChild(anim);
@@ -1159,9 +1225,10 @@ function drainAttackMapQueue() {
   pendingBlocked = [];
   let spawned = 0;
   for (const entry of batch) {
-    const color = MAP_COLORS[markerCategory(entry.ip)];
+    const category = markerCategory(entry.ip);
+    const color = MAP_COLORS[category];
     const [lat, lon] = markerLatLon(entry);
-    upsertMapMarker(entry.ip, lat, lon, color);
+    upsertMapMarker(entry, lat, lon, color, category);
     if (spawned < MAP_MAX_ARCS_PER_TICK) { spawnAttackArc(lat, lon, color); spawned++; }
   }
 }
@@ -1174,7 +1241,7 @@ function renderServerMarker() {
   const g = svgEl('g', { class: 'map-server-marker' });
   g.append(
     svgEl('circle', { cx: x, cy: y, r: 9, 'stroke-width': 1, opacity: 0.5 }),
-    svgEl('circle', { cx: x, cy: y, r: 3.5, class: 'server-core' }),
+    svgEl('circle', { cx: x, cy: y, r: 3.5, class: 'server-core', 'data-ip': '__server__' }),
     svgEl('text', { class: 'map-server-label', x: x + 6, y: y - 6 }),
   );
   g.querySelector('text').textContent = serverLocation.countryCode ? `server (${serverLocation.countryCode})` : 'server';
@@ -1261,6 +1328,8 @@ function setupMapZoomPan() {
     lastX = e.clientX; lastY = e.clientY;
     svg.setPointerCapture(e.pointerId);
     svg.classList.add('panning');
+    const tooltip = document.getElementById('map-tooltip');
+    if (tooltip) tooltip.hidden = true; // avoid it flickering over markers sliding under the cursor mid-drag
   });
   svg.addEventListener('pointermove', (e) => {
     if (!dragging) return;
@@ -1299,10 +1368,52 @@ function setupMapZoomPan() {
   svg.addEventListener('click', (e) => { if (moved) e.stopPropagation(); });
 }
 
+// Delegated on the whole SVG rather than per-marker: markers come and go
+// constantly (pruneMapMarkers removes them, drainAttackMapQueue adds
+// them), so one listener that reads whatever [data-ip] element is
+// currently under the pointer avoids attaching/detaching per marker.
+function setupMapTooltip() {
+  const svg = document.getElementById('attack-map-svg');
+  const tooltip = document.getElementById('map-tooltip');
+  const box = document.querySelector('.map-box');
+
+  function describe(ip) {
+    if (ip === '__server__') {
+      const loc = serverLocation && serverLocation.countryCode ? serverLocation.countryCode : 'unknown';
+      return { title: 'this server', meta: `location: ${loc}` };
+    }
+    const m = mapMarkers.get(ip);
+    if (!m) return null;
+    let where;
+    if (m.category === 'private') where = 'private/internal (no real location)';
+    else where = [m.city, m.country].filter(Boolean).join(', ') || 'location unknown';
+    const secAgo = Math.max(0, Math.round((performance.now() - m.lastSeen) / 1000));
+    const domainPart = m.domain ? ` · ${m.domain}` : '';
+    return { title: ip, meta: `${where} · ${m.count} blocked${domainPart} · ${secAgo}s ago` };
+  }
+
+  svg.addEventListener('pointermove', (e) => {
+    const target = e.target.closest && e.target.closest('[data-ip]');
+    if (!target) { tooltip.hidden = true; return; }
+    const info = describe(target.dataset.ip);
+    if (!info) { tooltip.hidden = true; return; }
+    tooltip.innerHTML = `<div class="ip">${escapeHtml(info.title)}</div><div class="meta">${escapeHtml(info.meta)}</div>`;
+    tooltip.hidden = false;
+    const boxRect = box.getBoundingClientRect();
+    // Clamp so the tooltip doesn't render partway outside the box near an edge.
+    const left = Math.min(e.clientX - boxRect.left + 12, boxRect.width - 160);
+    const top = Math.min(e.clientY - boxRect.top + 12, boxRect.height - 40);
+    tooltip.style.left = Math.max(4, left) + 'px';
+    tooltip.style.top = Math.max(4, top) + 'px';
+  });
+  svg.addEventListener('pointerleave', () => { tooltip.hidden = true; });
+}
+
 function initAttackMap() {
   pollServerLocation();
   setInterval(pollServerLocation, 30000);
   setupMapZoomPan();
+  setupMapTooltip();
 }
 
 setInterval(tick, 1000);

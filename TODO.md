@@ -193,6 +193,15 @@ more real than a laptop demo:
   around the map instead of wrapping across the edge — a cosmetic edge
   case (see `projectLatLon`'s doc comment in `dashboard/app/static/index.html`),
   not worth the extra complexity for how rarely it'd actually come up.
+- **The attack map's projection fit is noticeably less accurate for
+  huge, irregularly-shaped countries** (Russia, Canada, Brazil, Australia
+  — tens of pixels off in the fit's own residuals) than for compact ones
+  (Western Europe — within ~10px). The fit was calibrated against each
+  country's path-coordinate-average centroid vs. its real-world lat/lon
+  centroid, and those two notions of "centroid" genuinely diverge more
+  for large, asymmetric landmasses. Good enough for a cosmetic attack
+  map; not survey-grade, and not worth a fancier (non-linear, or
+  per-region) projection fit for what this is.
 - **`letsencrypt-sidecar` only supports HTTP-01**, not DNS-01 — no
   wildcard certs, and it needs port 80 reachable from the real internet.
   DNS-01 would remove that requirement but needs DNS provider API
