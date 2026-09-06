@@ -188,15 +188,6 @@ more real than a laptop demo:
 
 ## Known limitations / not fully verified
 
-- **Honeypot bait paths only work if the real backend never legitimately
-  serves them.** This demo's echo backend never does, so the default list
-  (`scoring-service-go/honeypot/honeypot.go`) is safe here — but a real
-  deployment must verify that for *their* actual application before
-  enabling this against real traffic. There's no threshold, no repeat
-  count, no second chance: a false match here bans a real user outright
-  on the first hit, by design (that's the entire point of the signal
-  being unambiguous — but it means the burden of "actually unambiguous"
-  is on whoever configures `HONEYPOT_PATHS`, not on the code).
 - **`letsencrypt-sidecar` only supports HTTP-01**, not DNS-01 — no
   wildcard certs, and it needs port 80 reachable from the real internet.
   DNS-01 would remove that requirement but needs DNS provider API

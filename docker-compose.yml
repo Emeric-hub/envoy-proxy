@@ -120,8 +120,6 @@ services:
       - CROWDSEC_URL=http://crowdsec:8080
       - CROWDSEC_API_KEY=${CROWDSEC_BOUNCER_KEY:-devbouncerkeychangeme}
       - CROWDSEC_POLL_INTERVAL=${CROWDSEC_POLL_INTERVAL:-10}
-      - ENABLE_HONEYPOT=${ENABLE_HONEYPOT:-true}
-      - HONEYPOT_PATHS=${HONEYPOT_PATHS:-}
     volumes:
       - ./crowdsec/feed:/var/log/crowdsec-feed
     expose:
