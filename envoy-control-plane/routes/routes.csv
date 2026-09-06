@@ -3,3 +3,6 @@ id,domain,target,port,ssl,cert_check,scoring,letsencrypt
 2,api.example.com,backend,8443,false,false,true,false
 3,admin.example.com,backend,8443,false,false,true,false
 4,secure.example.com,backend,8443,true,false,true,false
+5,blog.example.com,backend2,8443,false,false,true,false
+6,store.example.com,backend2,8443,false,false,true,false
+7,test.example.com,backend,8443,false,false,true,false

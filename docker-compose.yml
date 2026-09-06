@@ -328,6 +328,20 @@ services:
       # generates its own self-signed cert automatically for this port.
       - HTTPS_PORT=8443
 
+  # A second, identical backend — for testing multi-backend routing (the
+  # dashboard's topology diagram, per-backend charts) rather than any real
+  # functional difference from `backend` above. routes.csv points a few
+  # domains at this one instead, so there's an actual second distinct
+  # target:port to render/exercise.
+  backend2:
+    image: mendhak/http-https-echo:31
+    expose:
+      - "8080"
+      - "8443"
+    environment:
+      - HTTP_PORT=8080
+      - HTTPS_PORT=8443
+
   redis:
     image: redis:7-alpine
     expose:

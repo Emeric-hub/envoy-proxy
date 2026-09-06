@@ -8,6 +8,14 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **A second backend (`backend2`) and three more `routes.csv` domains**
+  (`blog.example.com`, `store.example.com` → `backend2`; `test.example.com`
+  → the original `backend`) — test scaffolding for multi-backend routing
+  (the topology diagram now has something real to fan into two distinct
+  targets) and a larger domain set to test against generally. No behavior
+  change to either backend — `backend2` is the same `mendhak/http-https-echo`
+  image as `backend`.
+
 - **`geoip-service`: opt-in local GeoIP lookups enriching the dashboard's
   attack globe with real locations.** A new Go service (profile `geoip`,
   off by default) that downloads and periodically refreshes a MaxMind
