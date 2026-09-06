@@ -48,6 +48,24 @@ func auditWouldBlockResponse(score float64) *authv3.CheckResponse {
 	}
 }
 
+// honeypotResponse: a deliberately unremarkable HTTP 404 — no branded
+// "blocked" body, no risk-score headers, nothing that would tell whoever
+// requested a bait path that it was recognized as one rather than a
+// genuinely missing route. The actual detection (CrowdSec ban, dashboard
+// event) already happened server-side before this response is built; the
+// client sees exactly what a real 404 looks like.
+func honeypotResponse() *authv3.CheckResponse {
+	return &authv3.CheckResponse{
+		Status: &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status: &typev3.HttpStatus{Code: typev3.StatusCode_NotFound},
+				Body:   "404 page not found\n",
+			},
+		},
+	}
+}
+
 // denyResponse: HTTP 403, plain-text body "blocked (risk=X.XX): <first
 // reason>", no headers — matches the original Python response exactly. If
 // reasons is somehow empty (deny requires a signal >= threshold, which

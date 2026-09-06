@@ -214,6 +214,10 @@ What it does do:
 - Dashboard off the network by default (loopback bind + optional IP allowlist)
 - Envoy admin API never published to the host
 - Fail-closed `ext_authz` (a scoring-service outage denies, doesn't allow)
+- Honeypot bait paths (`/wp-admin`, `/.env`, `/phpmyadmin`, ...) — the one
+  signal in this pipeline with zero false-positive risk by construction; a
+  hit bans the IP outright via the same CrowdSec pipeline a confirmed CRS
+  attack does (see `scoring-service-go/honeypot/`)
 
 What it explicitly does **not** do yet, or does with a caveat — see
 [TODO.md](TODO.md) for the full list:

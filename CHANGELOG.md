@@ -8,6 +8,24 @@ compress a lot of iteration into each entry.
 
 ### Added
 
+- **Honeypot bait paths** (`scoring-service-go/honeypot/`): a request for
+  `/wp-admin`, `/.env`, `/phpmyadmin`, or another classic scanner-bait
+  path (configurable via `HONEYPOT_PATHS`, `ENABLE_HONEYPOT`) is checked
+  before Coraza/CrowdSec are even consulted — unlike every other signal in
+  this pipeline, a hit carries zero false-positive risk by construction,
+  so it skips scoring/thresholds entirely and feeds the *same*
+  CRITICAL-match-bans-immediately CrowdSec pipeline a real CRS match
+  already uses (`crowdsec.LogModsecMatches`, reused as-is, no new
+  CrowdSec scenario needed). Responds with a deliberately unremarkable
+  404 (not the branded "blocked" page), so a scanner can't tell it hit a
+  honeypot rather than a genuinely missing path. Verified live end-to-end
+  against the real stack: hit `/wp-admin` with a spoofed public source
+  IP, confirmed a real CrowdSec ban fired (`crowdsecurity/modsecurity`),
+  and confirmed that same IP was then blocked on a completely unrelated,
+  benign route once `scoring-service`'s decision-poll cycle caught up —
+  and confirmed `AUDIT_MODE` correctly leaves it unenforced (200) while
+  still logging as a real dry-run signal, matching every other decision
+  path.
 - **`letsencrypt-sidecar`: opt-in automatic TLS via Let's Encrypt.** A new
   `routes.csv` column (`letsencrypt`) flags a domain for real
   issuance/renewal instead of `generate-cert.sh`'s self-signed flow —
